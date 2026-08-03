@@ -49,7 +49,7 @@
     Instala somente Claude Code e Codex CLI sem prompts.
 
 .NOTES
-    Versao: 2.11.0
+    Versao: 2.11.1
     Compatibilidade: Windows 10 1809+/11, Server 2019+, PowerShell 5.1+
 #>
 [CmdletBinding(DefaultParameterSetName='Interactive', SupportsShouldProcess=$true)]
@@ -104,9 +104,12 @@ if ($LogPath -or ($Silent -and -not $LogPath)) {
 # ----------------------------------------------------------
 # Versao e Historico de Atualizacoes
 # ----------------------------------------------------------
-$SCRIPT_VERSION = "2.11.0"
+$SCRIPT_VERSION = "2.11.1"
 $SCRIPT_DATA    = "03/08/2026"
 $CHANGELOG = @(
+    [PSCustomObject]@{ Versao = "2.11.1"; Data = "03/08/2026"; Descricao = "Diagnostico: detecta e repara PATH/PATHEXT, shims PowerShell, npm prefix/cache e permissoes do perfil" }
+    [PSCustomObject]@{ Versao = "2.11.1"; Data = "03/08/2026"; Descricao = "Inicializacao: testa cada CLI em processo isolado e aponta conflitos entre instalacoes" }
+    [PSCustomObject]@{ Versao = "2.11.1"; Data = "03/08/2026"; Descricao = "Claude Code: CLAUDE_CODE_GIT_BASH_PATH passa a apontar corretamente para o executavel bash.exe" }
     [PSCustomObject]@{ Versao = "2.11.0"; Data = "03/08/2026"; Descricao = "Usuario comum: instaladores, PATH, npm e WinGet passam a usar sempre o escopo do usuario" }
     [PSCustomObject]@{ Versao = "2.11.0"; Data = "03/08/2026"; Descricao = "Confiabilidade: valida codigos de saida e confirma cada instalacao antes de informar sucesso" }
     [PSCustomObject]@{ Versao = "2.11.0"; Data = "03/08/2026"; Descricao = "Claude Code: usa instalador nativo atual em processo isolado, inclusive no Windows Server" }
@@ -404,6 +407,7 @@ $script:PhaseTotal      = 0
 $script:ScriptStartTime = $null
 $script:InstallResults  = @()  # resumo final
 $script:OperationFailures = @{}
+$script:StartupHealthFindings = @()
 
 # Caracteres: usa Unicode quando suportado, ASCII como fallback (Windows 7/CMD legado/PS sem UTF-8)
 if ($script:Compat.UnicodeOk) {
@@ -462,6 +466,7 @@ function Start-Dashboard {
     $script:ScriptStartTime = Get-Date
     $script:InstallResults  = @()
     $script:OperationFailures = @{}
+    $script:StartupHealthFindings = @()
 }
 
 function Set-PreferredConsoleSize {
@@ -575,16 +580,40 @@ function Get-NpmCommandPath {
     return $null
 }
 
-function Invoke-NpmPrefixSafe {
-    param([int]$TimeoutSec = 4)
+function Invoke-ProcessProbe {
+    param(
+        [Parameter(Mandatory=$true)][string]$FilePath,
+        [string]$Arguments = '--version',
+        [int]$TimeoutSec = 12
+    )
+
+    $result = [ordered]@{
+        Success  = $false
+        ExitCode = $null
+        Output   = ''
+        Error    = ''
+        TimedOut = $false
+    }
 
     try {
-        $npmCmd = Get-NpmCommandPath
-        if (-not $npmCmd) { return "" }
+        if (-not (Test-Path -LiteralPath $FilePath -ErrorAction SilentlyContinue)) {
+            $result.Error = "Arquivo nao encontrado: $FilePath"
+            return [PSCustomObject]$result
+        }
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $env:ComSpec
-        $psi.Arguments = "/d /s /c `"`"$npmCmd`" config get prefix`""
+        $extension = [System.IO.Path]::GetExtension($FilePath)
+        if ($extension -in @('.cmd', '.bat')) {
+            $comspec = $env:ComSpec
+            if (-not $comspec -or -not (Test-Path -LiteralPath $comspec -ErrorAction SilentlyContinue)) {
+                $comspec = Join-Path $env:SystemRoot 'System32\cmd.exe'
+            }
+            $psi.FileName = $comspec
+            $psi.Arguments = "/d /s /c `"`"$FilePath`" $Arguments`""
+        } else {
+            $psi.FileName = $FilePath
+            $psi.Arguments = $Arguments
+        }
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
@@ -592,16 +621,63 @@ function Invoke-NpmPrefixSafe {
 
         $proc = [System.Diagnostics.Process]::Start($psi)
         if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+            $result.TimedOut = $true
+            $result.Error = "Timeout depois de $TimeoutSec segundos."
             try { $proc.Kill() } catch { }
-            return ""
+            return [PSCustomObject]$result
         }
 
-        if ($proc.ExitCode -ne 0) { return "" }
-        $out = $proc.StandardOutput.ReadToEnd()
-        return (($out -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1).Trim()
-    } catch { }
+        $result.ExitCode = $proc.ExitCode
+        $result.Output = $proc.StandardOutput.ReadToEnd().Trim()
+        $result.Error = $proc.StandardError.ReadToEnd().Trim()
+        $result.Success = ($proc.ExitCode -eq 0)
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
 
-    return ""
+    return [PSCustomObject]$result
+}
+
+function Invoke-PowerShellCommandProbe {
+    param(
+        [Parameter(Mandatory=$true)][string]$CommandName,
+        [int]$TimeoutSec = 15
+    )
+
+    $shellExe = if ($PSVersionTable.PSEdition -eq 'Core') {
+        Join-Path $PSHOME 'pwsh.exe'
+    } else {
+        Join-Path $PSHOME 'powershell.exe'
+    }
+    if (-not (Test-Path -LiteralPath $shellExe -ErrorAction SilentlyContinue)) {
+        $shellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    }
+
+    $safeName = $CommandName.Replace("'", "''")
+    $probeScript = "& { & '$safeName' --version }"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probeScript))
+    return Invoke-ProcessProbe -FilePath $shellExe -Arguments "-NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded" -TimeoutSec $TimeoutSec
+}
+
+function Invoke-NpmConfigValueSafe {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet('prefix','cache')][string]$Name,
+        [int]$TimeoutSec = 4
+    )
+
+    try {
+        $npmCmd = Get-NpmCommandPath
+        if (-not $npmCmd) { return '' }
+        $probe = Invoke-ProcessProbe -FilePath $npmCmd -Arguments "config get $Name" -TimeoutSec $TimeoutSec
+        if (-not $probe.Success) { return '' }
+        return (($probe.Output -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1).Trim()
+    } catch { }
+    return ''
+}
+
+function Invoke-NpmPrefixSafe {
+    param([int]$TimeoutSec = 4)
+    return Invoke-NpmConfigValueSafe -Name 'prefix' -TimeoutSec $TimeoutSec
 }
 function Get-CliToolInfo {
     param(
@@ -640,17 +716,22 @@ function Get-CliToolInfo {
 
     foreach ($candidate in ($candidates | Select-Object -Unique)) {
         if (-not (Test-Path -LiteralPath $candidate -ErrorAction SilentlyContinue)) { continue }
-        # Shims npm .ps1 normalmente terminam com 'exit', o que encerraria este
-        # instalador. O .cmd equivalente e testado antes e e seguro.
-        if ([System.IO.Path]::GetExtension($candidate) -ieq '.ps1') { continue }
 
         $version = ""
         $commandOk = $false
-        try {
-            $out = & $candidate --version 2>&1 | Out-String
-            $version = $out.Trim()
-            $commandOk = ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($version))
-        } catch { }
+        if ([System.IO.Path]::GetExtension($candidate) -ieq '.ps1') {
+            # Shims npm .ps1 normalmente terminam com 'exit'. Testa em outro
+            # processo para que esse exit nunca encerre o instalador principal.
+            $probe = Invoke-PowerShellCommandProbe -CommandName $candidate
+            $version = $probe.Output.Trim()
+            $commandOk = ($probe.Success -and -not [string]::IsNullOrWhiteSpace($version))
+        } else {
+            try {
+                $out = & $candidate --version 2>&1 | Out-String
+                $version = $out.Trim()
+                $commandOk = ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($version))
+            } catch { }
+        }
 
         if (-not $commandOk) { continue }
 
@@ -1453,18 +1534,22 @@ function Set-UserEnvVar {
     $u = Get-UsuarioInterativo
 
     if (-not $u.ElevadoComOutroUsr -or -not $u.Sid) {
-        # Cenario normal: grava no ramo do usuario atual
-        if ($Append) {
-            $existing = [Environment]::GetEnvironmentVariable($Name, "User")
-            if ($existing -and ($existing -split ";" | Where-Object { $_ -ieq $Value })) {
-                return  # ja presente, nao duplica
+        try {
+            # Cenario normal: grava no ramo do usuario atual
+            if ($Append) {
+                $existing = [Environment]::GetEnvironmentVariable($Name, "User")
+                if ($existing -and ($existing -split ";" | Where-Object { $_ -ieq $Value })) {
+                    return $true  # ja presente, nao duplica
+                }
+                $new = if ($existing) { "$($existing.TrimEnd(';'));$Value" } else { $Value }
+                [Environment]::SetEnvironmentVariable($Name, $new, "User")
+            } else {
+                [Environment]::SetEnvironmentVariable($Name, $Value, "User")
             }
-            $new = if ($existing) { "$($existing.TrimEnd(';'));$Value" } else { $Value }
-            [Environment]::SetEnvironmentVariable($Name, $new, "User")
-        } else {
-            [Environment]::SetEnvironmentVariable($Name, $Value, "User")
+            return $true
+        } catch {
+            return $false
         }
-        return
     }
 
     # Cenario TS/UAC: grava no hive do usuario real
@@ -1494,7 +1579,7 @@ function Set-UserEnvVar {
                 $existing = (Get-ItemProperty -Path $envKey -Name $Name -ErrorAction Stop).$Name
             } catch { }
             if ($existing -and ($existing -split ";" | Where-Object { $_ -ieq $Value })) {
-                return  # ja presente
+                return $true  # ja presente
             }
             $new = if ($existing) { "$($existing.TrimEnd(';'));$Value" } else { $Value }
             # PATH e ExpandString, outras vars normalmente String
@@ -1510,6 +1595,9 @@ function Set-UserEnvVar {
                 New-ItemProperty -Path $envKey -Name $Name -Value $Value -PropertyType String -Force | Out-Null
             }
         }
+        return $true
+    } catch {
+        return $false
     } finally {
         if ($carreguei) {
             [gc]::Collect()
@@ -1843,53 +1931,154 @@ function Ensure-NodeJS {
     return $script:NodeJSResultado
 }
 
+# --- Normaliza uma entrada de PATH apenas para comparacao ---
+function ConvertTo-NormalizedPathEntry {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $entry = $Value.Trim()
+    if ($entry.Length -ge 2 -and $entry.StartsWith('"') -and $entry.EndsWith('"')) {
+        $entry = $entry.Substring(1, $entry.Length - 2).Trim()
+    }
+    try { $entry = [Environment]::ExpandEnvironmentVariables($entry) } catch { }
+    if ($entry.Length -gt 3) { $entry = $entry.TrimEnd('\') }
+    return $entry
+}
+
+function Test-DirectoryWriteAccess {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container -ErrorAction SilentlyContinue)) { return $false }
+    $testFile = Join-Path $Path ('.ia-install-write-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $stream = [System.IO.File]::Open($testFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $stream.Close()
+        Remove-Item -LiteralPath $testFile -Force -ErrorAction SilentlyContinue
+        return $true
+    } catch {
+        try { if ($stream) { $stream.Close() } } catch { }
+        Remove-Item -LiteralPath $testFile -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+}
+
+function Find-GitBashExecutable {
+    $u = Get-UsuarioInterativo
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $configured = Get-UserEnvVar -Name 'CLAUDE_CODE_GIT_BASH_PATH'
+    if ($configured) {
+        [void]$candidates.Add($configured)
+        [void]$candidates.Add((Join-Path $configured 'bin\bash.exe'))
+        [void]$candidates.Add((Join-Path $configured 'usr\bin\bash.exe'))
+    }
+
+    $gitRoots = @(
+        (Join-Path $u.LocalAppData 'Programs\Git'),
+        (Join-Path $env:ProgramFiles 'Git')
+    )
+    if (${env:ProgramFiles(x86)}) { $gitRoots += (Join-Path ${env:ProgramFiles(x86)} 'Git') }
+    foreach ($root in $gitRoots) {
+        if ([string]::IsNullOrWhiteSpace($root)) { continue }
+        [void]$candidates.Add((Join-Path $root 'bin\bash.exe'))
+        [void]$candidates.Add((Join-Path $root 'usr\bin\bash.exe'))
+    }
+
+    try {
+        $gitCommand = Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($gitCommand -and $gitCommand.Source) {
+            $gitRoot = Split-Path (Split-Path $gitCommand.Source -Parent) -Parent
+            [void]$candidates.Add((Join-Path $gitRoot 'bin\bash.exe'))
+            [void]$candidates.Add((Join-Path $gitRoot 'usr\bin\bash.exe'))
+        }
+    } catch { }
+
+    return $candidates |
+        Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf -ErrorAction SilentlyContinue) } |
+        Select-Object -Unique -First 1
+}
+
 # --- Verifica e corrige o PATH para ferramentas CLI ---
 function Test-And-Fix-Path {
     $u = Get-UsuarioInterativo
     $caminhos = @(
-        "$($u.AppData)\npm",
-        "$env:ProgramFiles\nodejs",
-        "${env:ProgramFiles(x86)}\nodejs",
-        "$($u.UserProfile)\.local\bin"
+        (Join-Path $u.AppData 'npm'),
+        (Join-Path $u.LocalAppData 'nodejs'),
+        (Join-Path $u.LocalAppData 'Microsoft\WinGet\Links'),
+        (Join-Path $u.LocalAppData 'Programs\Git\cmd'),
+        (Join-Path $u.LocalAppData 'Programs\Git\bin'),
+        (Join-Path $env:ProgramFiles 'nodejs'),
+        (Join-Path $u.UserProfile '.local\bin')
     )
+    if (${env:ProgramFiles(x86)}) { $caminhos += (Join-Path ${env:ProgramFiles(x86)} 'nodejs') }
+    $caminhos = $caminhos | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
 
-    # Le PATH do usuario REAL (hive correto em cenario UAC)
-    $pathUsuario  = Get-UserEnvVar -Name "Path"
-    if (-not $pathUsuario) { $pathUsuario = "" }
-    $pathMaquina  = [Environment]::GetEnvironmentVariable("Path", "Machine")
-    $pathCompleto = "$pathMaquina;$pathUsuario"
-    $atualizado   = $false
-    $problemas    = @()
-    $corrigidos   = @()
+    # Le e saneia somente o PATH do usuario. Entradas inexistentes nao sao
+    # removidas automaticamente, pois podem apontar para rede ou midia offline.
+    $pathUsuario = Get-UserEnvVar -Name 'Path'
+    if (-not $pathUsuario) { $pathUsuario = '' }
+    $cleanEntries = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    $atualizado = $false
+    $corrigidos = New-Object System.Collections.Generic.List[string]
+
+    foreach ($rawEntry in ($pathUsuario -split ';')) {
+        if ([string]::IsNullOrWhiteSpace($rawEntry)) {
+            if ($pathUsuario.Length -gt 0) { $atualizado = $true }
+            continue
+        }
+        $cleanEntry = $rawEntry.Trim()
+        if ($cleanEntry.Length -ge 2 -and $cleanEntry.StartsWith('"') -and $cleanEntry.EndsWith('"')) {
+            $cleanEntry = $cleanEntry.Substring(1, $cleanEntry.Length - 2).Trim()
+            $atualizado = $true
+        }
+        $key = ConvertTo-NormalizedPathEntry -Value $cleanEntry
+        if ([string]::IsNullOrWhiteSpace($key)) { $atualizado = $true; continue }
+        if ($seen.ContainsKey($key)) { $atualizado = $true; continue }
+        $seen[$key] = $true
+        [void]$cleanEntries.Add($cleanEntry)
+    }
+
+    $pathMaquina = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $allKeys = @{}
+    foreach ($entry in (($pathMaquina + ';' + ($cleanEntries -join ';')) -split ';')) {
+        $key = ConvertTo-NormalizedPathEntry -Value $entry
+        if ($key) { $allKeys[$key] = $true }
+    }
 
     foreach ($dir in $caminhos) {
-        if (-not (Test-Path -LiteralPath $dir -ErrorAction SilentlyContinue)) { continue }
-
-        $noPath = ($pathCompleto -split ";") -notcontains $dir
-        if ($noPath) {
-            $problemas += $dir
-            # Adiciona ao PATH do usuario
-            $pathUsuario = ($pathUsuario.TrimEnd(";") + ";$dir").TrimStart(";")
-            $atualizado  = $true
-            $corrigidos += $dir
-        }
-
-        # Garante na sessao atual tambem
-        if ($env:Path -notlike "*$dir*") {
-            $env:Path = "$dir;$env:Path"
+        if (-not (Test-Path -LiteralPath $dir -PathType Container -ErrorAction SilentlyContinue)) { continue }
+        $key = ConvertTo-NormalizedPathEntry -Value $dir
+        if (-not $allKeys.ContainsKey($key)) {
+            [void]$cleanEntries.Add($dir)
+            $allKeys[$key] = $true
+            $atualizado = $true
+            [void]$corrigidos.Add($dir)
         }
     }
 
     if ($atualizado) {
-        Set-UserEnvVar -Name "Path" -Value $pathUsuario
-        Write-Warn "PATH incompleto. Entradas adicionadas ao usuario '$($u.Username)':"
-        foreach ($c in $corrigidos) { Write-Ok "  + $c" }
-        Write-Warn "Abra um novo terminal para que as alteracoes tenham efeito."
+        $novoPath = $cleanEntries -join ';'
+        if (Set-UserEnvVar -Name 'Path' -Value $novoPath) {
+            Write-Warn "PATH do usuario '$($u.Username)' foi normalizado."
+            foreach ($c in $corrigidos) { Write-Ok "  + $c" }
+            $null = Send-EnvChangeNotification
+        } else {
+            Write-Fail 'Nao foi possivel gravar o PATH corrigido no perfil do usuario.'
+            return $false
+        }
     } else {
-        Write-Ok "PATH configurado corretamente."
+        Write-Ok 'PATH do usuario sem duplicidades e com as entradas necessarias.'
     }
 
-    return $problemas.Count -eq 0
+    Update-SessionPath
+    foreach ($dir in $caminhos) {
+        if ((Test-Path -LiteralPath $dir -PathType Container -ErrorAction SilentlyContinue) -and
+            -not (($env:Path -split ';' | ForEach-Object { ConvertTo-NormalizedPathEntry $_ }) -contains (ConvertTo-NormalizedPathEntry $dir))) {
+            Write-Fail "A sessao atual ainda nao enxerga: $dir"
+            return $false
+        }
+    }
+    return $true
 }
 
 <#
@@ -1957,6 +2146,305 @@ function Repair-NpmRc {
         return $true
     } catch {
         return $false
+    }
+}
+
+function Invoke-StartupHealthCheck {
+    param(
+        [bool]$CheckGit        = $false,
+        [bool]$CheckClaudeCLI  = $false,
+        [bool]$CheckCodexCLI   = $false,
+        [bool]$CheckOpenCode   = $false,
+        [bool]$CheckClaudeDesk = $false,
+        [bool]$CheckCodexDesk  = $false,
+        [bool]$CheckOpenDesk   = $false,
+        [switch]$RecordFailures
+    )
+
+    $findings = New-Object System.Collections.Generic.List[object]
+    $repairs = New-Object System.Collections.Generic.List[string]
+    $u = Get-UsuarioInterativo
+    $hasCli = $CheckGit -or $CheckClaudeCLI -or $CheckCodexCLI -or $CheckOpenCode
+    $anySelected = $hasCli -or $CheckClaudeDesk -or $CheckCodexDesk -or $CheckOpenDesk
+
+    Write-Host '  Saude de inicializacao:' -ForegroundColor White
+
+    if ($anySelected) {
+        foreach ($baseDir in @(
+            [PSCustomObject]@{ Name = 'USERPROFILE'; Path = $u.UserProfile; Writable = $false },
+            [PSCustomObject]@{ Name = 'APPDATA'; Path = $u.AppData; Writable = $true },
+            [PSCustomObject]@{ Name = 'LOCALAPPDATA'; Path = $u.LocalAppData; Writable = $true },
+            [PSCustomObject]@{ Name = 'TEMP'; Path = $env:TEMP; Writable = $true }
+        )) {
+            if ([string]::IsNullOrWhiteSpace($baseDir.Path) -or
+                -not [System.IO.Path]::IsPathRooted($baseDir.Path) -or
+                -not (Test-Path -LiteralPath $baseDir.Path -PathType Container -ErrorAction SilentlyContinue)) {
+                [void]$findings.Add([PSCustomObject]@{ Tool = 'Ambiente'; Critical = $true; Message = "$($baseDir.Name) e invalido ou nao existe: '$($baseDir.Path)'" })
+            } elseif ($baseDir.Writable -and -not (Test-DirectoryWriteAccess -Path $baseDir.Path)) {
+                [void]$findings.Add([PSCustomObject]@{ Tool = 'Ambiente'; Critical = $true; Message = "Sem permissao de gravacao em $($baseDir.Name): $($baseDir.Path)" })
+            }
+        }
+    }
+
+    if ($hasCli) {
+        if (-not (Test-And-Fix-Path)) {
+            [void]$findings.Add([PSCustomObject]@{ Tool = 'Ambiente'; Critical = $true; Message = 'PATH nao pode ser corrigido ou recarregado.' })
+        }
+
+        if ($env:Path -and $env:Path.Length -gt 8191) {
+            [void]$findings.Add([PSCustomObject]@{ Tool = 'PATH'; Critical = $false; Message = "PATH efetivo possui $($env:Path.Length) caracteres; comandos via cmd.exe podem falhar acima de 8191." })
+        }
+        $effectivePathEntries = @($env:Path -split ';' | ForEach-Object { ConvertTo-NormalizedPathEntry $_ } | Where-Object { $_ })
+        $duplicateEffective = @($effectivePathEntries | Group-Object | Where-Object { $_.Count -gt 1 } | Select-Object -First 5)
+        if ($duplicateEffective.Count -gt 0) {
+            [void]$findings.Add([PSCustomObject]@{ Tool = 'PATH'; Critical = $false; Message = "Entradas duplicadas permanecem no PATH efetivo (possivelmente no escopo da maquina): $($duplicateEffective.Name -join ', ')" })
+        }
+
+        # PATHs antigos relacionados a estas ferramentas sao informados, mas nao
+        # removidos automaticamente: podem ser unidades de rede temporariamente offline.
+        $staleRelevant = New-Object System.Collections.Generic.List[string]
+        foreach ($entry in ((Get-UserEnvVar -Name 'Path') -split ';')) {
+            $expanded = ConvertTo-NormalizedPathEntry -Value $entry
+            if (-not $expanded) { continue }
+            if ($entry -match '%[^%]+%' -and $expanded -match '%[^%]+%') {
+                [void]$findings.Add([PSCustomObject]@{ Tool = 'PATH'; Critical = $false; Message = "Variavel nao resolvida no PATH: $entry" })
+                continue
+            }
+            if ($expanded -match '(?i)(\\npm($|\\)|\\nodejs($|\\)|\\\.local\\bin($|\\)|\\Git\\(cmd|bin)($|\\)|WinGet\\Links)' -and
+                $expanded -notmatch '%' -and
+                -not (Test-Path -LiteralPath $expanded -ErrorAction SilentlyContinue)) {
+                [void]$staleRelevant.Add($expanded)
+            }
+        }
+        foreach ($stale in ($staleRelevant | Select-Object -Unique -First 5)) {
+            [void]$findings.Add([PSCustomObject]@{ Tool = 'PATH'; Critical = $false; Message = "Entrada relacionada a IA nao existe: $stale" })
+        }
+
+        $requiredPathExt = @('.COM','.EXE','.BAT','.CMD')
+        $processPathExt = if ($env:PATHEXT) { $env:PATHEXT } else { '' }
+        $pathExtEntries = @($processPathExt -split ';' | Where-Object { $_ } | ForEach-Object { $_.Trim().ToUpperInvariant() })
+        $missingPathExt = @($requiredPathExt | Where-Object { $pathExtEntries -notcontains $_ })
+        if ($missingPathExt.Count -gt 0) {
+            $newPathExt = (@($pathExtEntries) + $missingPathExt | Select-Object -Unique) -join ';'
+            if (Set-UserEnvVar -Name 'PATHEXT' -Value $newPathExt) {
+                $env:PATHEXT = $newPathExt
+                [void]$repairs.Add('PATHEXT restaurado com suporte a .EXE, .BAT e .CMD.')
+            } else {
+                [void]$findings.Add([PSCustomObject]@{ Tool = 'Ambiente'; Critical = $true; Message = 'PATHEXT nao inclui extensoes executaveis padrao e nao pode ser corrigido.' })
+            }
+        }
+
+        if (-not $env:ComSpec -or -not (Test-Path -LiteralPath $env:ComSpec -PathType Leaf -ErrorAction SilentlyContinue)) {
+            $cmdExe = Join-Path $env:SystemRoot 'System32\cmd.exe'
+            if ((Test-Path -LiteralPath $cmdExe -PathType Leaf -ErrorAction SilentlyContinue) -and
+                (Set-UserEnvVar -Name 'ComSpec' -Value $cmdExe)) {
+                $env:ComSpec = $cmdExe
+                [void]$repairs.Add("ComSpec corrigido para $cmdExe.")
+            } else {
+                [void]$findings.Add([PSCustomObject]@{ Tool = 'Ambiente'; Critical = $true; Message = 'cmd.exe/ComSpec indisponivel; shims .cmd nao iniciarao.' })
+            }
+        }
+
+        $dirsToCheck = @()
+        if ($CheckClaudeCLI) { $dirsToCheck += (Join-Path $u.UserProfile '.local\bin') }
+        if ($CheckCodexCLI -or $CheckOpenCode) {
+            $dirsToCheck += (Join-Path $u.AppData 'npm')
+            $dirsToCheck += (Join-Path $u.AppData 'npm-cache')
+        }
+        foreach ($dir in ($dirsToCheck | Where-Object { $_ } | Select-Object -Unique)) {
+            if (-not (Test-Path -LiteralPath $dir -PathType Container -ErrorAction SilentlyContinue)) {
+                try { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null } catch { }
+            }
+            if (-not (Test-DirectoryWriteAccess -Path $dir)) {
+                [void]$findings.Add([PSCustomObject]@{ Tool = 'Ambiente'; Critical = $true; Message = "Sem permissao de gravacao em: $dir" })
+            }
+        }
+    }
+
+    if ($CheckCodexCLI -or $CheckOpenCode) {
+        $expectedPrefix = Join-Path $u.AppData 'npm'
+        $expectedCache = Join-Path $u.AppData 'npm-cache'
+        $npmCmd = Get-NpmCommandPath
+        if ($npmCmd) {
+            $npmSources = @(Get-Command npm.cmd -All -CommandType Application -ErrorAction SilentlyContinue |
+                Where-Object { $_.Source } | Select-Object -ExpandProperty Source -Unique)
+            if ($npmSources.Count -gt 1) {
+                [void]$findings.Add([PSCustomObject]@{ Tool = 'npm'; Critical = $false; Message = "Mais de um npm.cmd foi encontrado. Em uso: $npmCmd. Todos: $($npmSources -join ', ')" })
+            }
+            $npmProbe = Invoke-ProcessProbe -FilePath $npmCmd -Arguments '--version'
+            if (-not $npmProbe.Success) {
+                [void]$findings.Add([PSCustomObject]@{ Tool = 'npm'; Critical = $true; Message = "npm existe, mas nao inicia (codigo $($npmProbe.ExitCode)): $($npmProbe.Error)" })
+            } else {
+                $prefixBefore = Invoke-NpmConfigValueSafe -Name 'prefix'
+                $cacheBefore = Invoke-NpmConfigValueSafe -Name 'cache'
+                if ((ConvertTo-NormalizedPathEntry $prefixBefore) -ine (ConvertTo-NormalizedPathEntry $expectedPrefix) -or
+                    (ConvertTo-NormalizedPathEntry $cacheBefore) -ine (ConvertTo-NormalizedPathEntry $expectedCache)) {
+                    $npmrc = Join-Path $u.UserProfile '.npmrc'
+                    if (Repair-NpmRc -Path $npmrc -Prefix $expectedPrefix -Cache $expectedCache) {
+                        [void]$repairs.Add(".npmrc ajustado para o perfil de $($u.Username).")
+                    }
+                }
+                $prefixAfter = Invoke-NpmConfigValueSafe -Name 'prefix'
+                $cacheAfter = Invoke-NpmConfigValueSafe -Name 'cache'
+                if ((ConvertTo-NormalizedPathEntry $prefixAfter) -ine (ConvertTo-NormalizedPathEntry $expectedPrefix)) {
+                    [void]$findings.Add([PSCustomObject]@{ Tool = 'npm'; Critical = $true; Message = "Prefixo npm incorreto: '$prefixAfter' (esperado '$expectedPrefix')." })
+                }
+                if ((ConvertTo-NormalizedPathEntry $cacheAfter) -ine (ConvertTo-NormalizedPathEntry $expectedCache)) {
+                    [void]$findings.Add([PSCustomObject]@{ Tool = 'npm'; Critical = $true; Message = "Cache npm incorreto: '$cacheAfter' (esperado '$expectedCache')." })
+                }
+            }
+        }
+
+        try {
+            $nodeCommands = @(Get-Command node.exe -All -CommandType Application -ErrorAction SilentlyContinue)
+            $nodeCmd = $nodeCommands | Select-Object -First 1
+            if ($nodeCmd -and $nodeCmd.Source) {
+                $nodeProbe = Invoke-ProcessProbe -FilePath $nodeCmd.Source -Arguments '--version'
+                if (-not $nodeProbe.Success) {
+                    $hint = if ($env:NODE_OPTIONS) { ' Verifique tambem a variavel NODE_OPTIONS.' } else { '' }
+                    [void]$findings.Add([PSCustomObject]@{ Tool = 'Node.js'; Critical = $true; Message = "node.exe nao inicia.$hint $($nodeProbe.Error)".Trim() })
+                }
+                $nodeSources = @($nodeCommands | Where-Object { $_.Source } | Select-Object -ExpandProperty Source -Unique)
+                if ($nodeSources.Count -gt 1) {
+                    [void]$findings.Add([PSCustomObject]@{ Tool = 'Node.js'; Critical = $false; Message = "Mais de um node.exe foi encontrado. Em uso: $($nodeCmd.Source). Todos: $($nodeSources -join ', ')" })
+                }
+            }
+        } catch { }
+
+        foreach ($certVar in @('NODE_EXTRA_CA_CERTS','SSL_CERT_FILE')) {
+            $certPath = [Environment]::GetEnvironmentVariable($certVar, 'Process')
+            if ($certPath -and -not (Test-Path -LiteralPath $certPath -PathType Leaf -ErrorAction SilentlyContinue)) {
+                [void]$findings.Add([PSCustomObject]@{ Tool = 'Node.js'; Critical = $false; Message = "$certVar aponta para um certificado inexistente; conexoes HTTPS podem falhar." })
+            }
+        }
+    }
+
+    if ($CheckClaudeCLI -or $CheckClaudeDesk) {
+        $bashExe = Find-GitBashExecutable
+        $configuredBash = Get-UserEnvVar -Name 'CLAUDE_CODE_GIT_BASH_PATH'
+        if ($bashExe) {
+            if ((ConvertTo-NormalizedPathEntry $configuredBash) -ine (ConvertTo-NormalizedPathEntry $bashExe)) {
+                if (Set-UserEnvVar -Name 'CLAUDE_CODE_GIT_BASH_PATH' -Value $bashExe) {
+                    $env:CLAUDE_CODE_GIT_BASH_PATH = $bashExe
+                    [void]$repairs.Add("CLAUDE_CODE_GIT_BASH_PATH corrigido para $bashExe.")
+                } else {
+                    [void]$findings.Add([PSCustomObject]@{ Tool = 'Claude Code'; Critical = $true; Message = 'Nao foi possivel corrigir CLAUDE_CODE_GIT_BASH_PATH.' })
+                }
+            }
+            $bashProbe = Invoke-ProcessProbe -FilePath $bashExe -Arguments '--version'
+            if (-not $bashProbe.Success) {
+                [void]$findings.Add([PSCustomObject]@{ Tool = 'Claude Code'; Critical = $true; Message = "Git Bash foi encontrado, mas nao inicia: $($bashProbe.Error)" })
+            }
+        } elseif ($configuredBash) {
+            [void]$findings.Add([PSCustomObject]@{ Tool = 'Claude Code'; Critical = $true; Message = "CLAUDE_CODE_GIT_BASH_PATH e invalido: $configuredBash" })
+        }
+    }
+
+    $toolDefs = @(
+        [PSCustomObject]@{ Enabled = $CheckClaudeCLI; Tool = 'Claude Code'; Cmd = 'claude'; Package = '@anthropic-ai/claude-code'; NpmShim = $false },
+        [PSCustomObject]@{ Enabled = $CheckCodexCLI;  Tool = 'Codex CLI';   Cmd = 'codex';  Package = '@openai/codex';             NpmShim = $true  },
+        [PSCustomObject]@{ Enabled = $CheckOpenCode; Tool = 'OpenCode';    Cmd = 'opencode'; Package = 'opencode-ai';             NpmShim = $true  }
+    )
+
+    foreach ($tool in $toolDefs) {
+        if (-not $tool.Enabled) { continue }
+        try {
+            $currentResolution = Get-Command $tool.Cmd -ErrorAction SilentlyContinue
+            if ($currentResolution -and $currentResolution.CommandType -in @('Alias','Function','Filter','Cmdlet')) {
+                [void]$findings.Add([PSCustomObject]@{ Tool = $tool.Tool; Critical = $false; Message = "O nome '$($tool.Cmd)' esta sendo interceptado por $($currentResolution.CommandType) na sessao atual." })
+            }
+        } catch { }
+        $info = Get-CliToolInfo -Cmd $tool.Cmd -NpmPackage $tool.Package
+        if (-not $info.Installed) {
+            if ($info.Method -eq 'broken-npm-package') {
+                [void]$findings.Add([PSCustomObject]@{ Tool = $tool.Tool; Critical = $true; Message = "Pacote existe, mas o comando nao inicia: $($info.Source)" })
+            }
+            continue
+        }
+
+        $shellProbe = Invoke-PowerShellCommandProbe -CommandName $tool.Cmd
+        if (-not $shellProbe.Success -and $tool.NpmShim) {
+            $psShim = Join-Path $u.AppData ("npm\$($tool.Cmd).ps1")
+            $cmdShim = Join-Path $u.AppData ("npm\$($tool.Cmd).cmd")
+            $cmdProbe = if (Test-Path -LiteralPath $cmdShim -PathType Leaf -ErrorAction SilentlyContinue) {
+                Invoke-ProcessProbe -FilePath $cmdShim -Arguments '--version'
+            } else { $null }
+
+            if ($cmdProbe -and $cmdProbe.Success -and (Test-Path -LiteralPath $psShim -PathType Leaf -ErrorAction SilentlyContinue)) {
+                $backup = "$psShim.disabled-by-ia-install"
+                if (Test-Path -LiteralPath $backup -ErrorAction SilentlyContinue) {
+                    $backup = "$backup.$([DateTime]::Now.ToString('yyyyMMddHHmmss'))"
+                }
+                try {
+                    Move-Item -LiteralPath $psShim -Destination $backup -Force -ErrorAction Stop
+                    $shellProbe = Invoke-PowerShellCommandProbe -CommandName $tool.Cmd
+                    if ($shellProbe.Success) {
+                        [void]$repairs.Add("Shim PowerShell bloqueado de $($tool.Cmd) foi desativado; o .cmd funcional sera usado.")
+                    } else {
+                        Move-Item -LiteralPath $backup -Destination $psShim -Force -ErrorAction SilentlyContinue
+                    }
+                } catch { }
+            }
+        }
+
+        if (-not $shellProbe.Success) {
+            $probeMessage = if ($shellProbe.Error) { $shellProbe.Error } else { $shellProbe.Output }
+            $probeMessage = (($probeMessage -split "`r?`n") | Where-Object { $_ } | Select-Object -First 1)
+            [void]$findings.Add([PSCustomObject]@{ Tool = $tool.Tool; Critical = $true; Message = "O comando '$($tool.Cmd)' existe, mas falha ao iniciar no PowerShell: $probeMessage" })
+        }
+
+        try {
+            $sources = @(Get-Command $tool.Cmd -All -ErrorAction SilentlyContinue |
+                Where-Object { $_.Source -and (Test-Path -LiteralPath $_.Source -ErrorAction SilentlyContinue) } |
+                Select-Object -ExpandProperty Source -Unique)
+            $sourceDirs = @($sources | ForEach-Object { Split-Path $_ -Parent } | Select-Object -Unique)
+            if ($sourceDirs.Count -gt 1) {
+                $activeDir = Split-Path $info.Source -Parent
+                $otherDirs = @($sourceDirs | Where-Object { $_ -ine $activeDir } | Select-Object -First 4)
+                [void]$findings.Add([PSCustomObject]@{ Tool = $tool.Tool; Critical = $false; Message = "Multiplas instalacoes podem disputar o PATH. Em uso: $($info.Source). Outros locais: $($otherDirs -join ', ')" })
+            }
+        } catch { }
+    }
+
+    if ($CheckClaudeDesk -or $CheckCodexDesk -or $CheckOpenDesk) {
+        try {
+            $appxPatterns = New-Object System.Collections.Generic.List[string]
+            if ($CheckClaudeDesk) { [void]$appxPatterns.Add('(?i)Claude') }
+            if ($CheckCodexDesk)  { [void]$appxPatterns.Add('(?i)(ChatGPT|Codex|OpenAI)') }
+            if ($CheckOpenDesk)   { [void]$appxPatterns.Add('(?i)OpenCode') }
+            $allAppx = Get-AppxPackage -ErrorAction SilentlyContinue
+            foreach ($pattern in $appxPatterns) {
+                foreach ($pkg in @($allAppx | Where-Object { $_.Name -match $pattern -or $_.PackageFullName -match $pattern })) {
+                    if ($pkg.Status -and $pkg.Status.ToString() -ne 'Ok') {
+                        [void]$findings.Add([PSCustomObject]@{ Tool = $pkg.Name; Critical = $true; Message = "Pacote AppX registrado com status $($pkg.Status)." })
+                    }
+                    if ($pkg.InstallLocation -and -not (Test-Path -LiteralPath $pkg.InstallLocation -PathType Container -ErrorAction SilentlyContinue)) {
+                        [void]$findings.Add([PSCustomObject]@{ Tool = $pkg.Name; Critical = $true; Message = "Diretorio AppX ausente: $($pkg.InstallLocation)" })
+                    }
+                }
+            }
+        } catch { }
+    }
+
+    foreach ($repair in $repairs) { Write-Ok "Reparado: $repair" }
+    foreach ($finding in $findings) {
+        if ($finding.Critical) { Write-Fail "$($finding.Tool): $($finding.Message)" }
+        else { Write-Warn "$($finding.Tool): $($finding.Message)" }
+    }
+    if ($findings.Count -eq 0) { Write-Ok 'Nenhum problema de inicializacao detectado.' }
+    Write-Host ''
+
+    $script:StartupHealthFindings = @($findings | ForEach-Object { $_ })
+    if ($RecordFailures) {
+        foreach ($finding in $findings | Where-Object { $_.Critical -and $_.Tool -in @('Claude Code','Codex CLI','OpenCode') }) {
+            Set-OperationFailure -Name $finding.Tool -Reason $finding.Message
+        }
+    }
+
+    return [PSCustomObject]@{
+        Repairs = @($repairs | ForEach-Object { $_ })
+        Findings = @($findings | ForEach-Object { $_ })
+        Healthy = (@($findings | Where-Object { $_.Critical }).Count -eq 0)
     }
 }
 
@@ -2119,6 +2607,15 @@ function Invoke-Diagnostico {
     Write-Host ""
     Write-Host "  Verificando ferramentas selecionadas..." -ForegroundColor DarkGray
     Write-Host ""
+
+    $null = Invoke-StartupHealthCheck `
+        -CheckGit        $CheckGit `
+        -CheckClaudeCLI  $CheckClaudeCLI `
+        -CheckCodexCLI   $CheckCodexCLI `
+        -CheckOpenCode   $CheckOpenCode `
+        -CheckClaudeDesk $CheckClaudeDesk `
+        -CheckCodexDesk  $CheckCodexDesk `
+        -CheckOpenDesk   $CheckOpenDesk
 
     # Garante caminhos npm/node no PATH para deteccao
     $uDiag = Get-UsuarioInterativo
@@ -3040,6 +3537,8 @@ if ($instalarCodexDesk)  { $fasesAtivas++ }
 if ($instalarOpenDesk)   { $fasesAtivas++ }
 if ($instalarCodexCLI)   { $fasesAtivas++ }
 if ($instalarOpenCode)   { $fasesAtivas++ }
+if ($instalarGit -or $instalarClaudeCLI -or $instalarCodexCLI -or $instalarOpenCode -or
+    $instalarClaudeDesk -or $instalarCodexDesk -or $instalarOpenDesk) { $fasesAtivas++ }
 Start-Dashboard -TotalPhases $fasesAtivas
 Write-Banner
 
@@ -3292,14 +3791,28 @@ if ($instalarGit) {
 
     if ($gitBashPath -and $instalarClaudeCLI) {
         Write-Step "Configurando CLAUDE_CODE_GIT_BASH_PATH..."
+        $gitBashExe = Find-GitBashExecutable
+        if (-not $gitBashExe) {
+            foreach ($candidate in @(
+                (Join-Path $gitBashPath 'bin\bash.exe'),
+                (Join-Path $gitBashPath 'usr\bin\bash.exe')
+            )) {
+                if (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction SilentlyContinue) {
+                    $gitBashExe = $candidate
+                    break
+                }
+            }
+        }
         $currentVal = Get-UserEnvVar -Name "CLAUDE_CODE_GIT_BASH_PATH"
-        if ($currentVal -eq $gitBashPath) {
+        if (-not $gitBashExe) {
+            Write-Warn "Git foi detectado, mas o executavel bash.exe nao foi encontrado em $gitBashPath."
+        } elseif ((ConvertTo-NormalizedPathEntry $currentVal) -ieq (ConvertTo-NormalizedPathEntry $gitBashExe)) {
             Write-Ok "CLAUDE_CODE_GIT_BASH_PATH ja esta configurado. Nenhuma alteracao necessaria."
         } else {
-            $null = Set-UserEnvVar -Name "CLAUDE_CODE_GIT_BASH_PATH" -Value $gitBashPath
-            $env:CLAUDE_CODE_GIT_BASH_PATH = $gitBashPath
+            $null = Set-UserEnvVar -Name "CLAUDE_CODE_GIT_BASH_PATH" -Value $gitBashExe
+            $env:CLAUDE_CODE_GIT_BASH_PATH = $gitBashExe
             $null = Broadcast-EnvChange
-            Write-Ok "CLAUDE_CODE_GIT_BASH_PATH = $gitBashPath (usuario '$($uGit.Username)')"
+            Write-Ok "CLAUDE_CODE_GIT_BASH_PATH = $gitBashExe (usuario '$($uGit.Username)')"
         }
         Pause-Readable 3
     }
@@ -3803,6 +4316,22 @@ if ($algumaCLI) {
     # Atualiza PATH na sessao atual (PowerShell corrente) combinando Machine + User(real)
     $pathMaquinaAtual = [Environment]::GetEnvironmentVariable("Path", "Machine")
     $env:Path = ($pathMaquinaAtual.TrimEnd(";") + ";" + $currentPath.TrimStart(";")).TrimEnd(";")
+}
+
+# ----------------------------------------------------------
+# TESTE FINAL DE INICIALIZACAO (apos instalacoes e PATH)
+# ----------------------------------------------------------
+if ($algumaCLI -or $instalarClaudeDesk -or $instalarCodexDesk -or $instalarOpenDesk) {
+    Write-Phase 'Teste final de inicializacao'
+    $null = Invoke-StartupHealthCheck `
+        -CheckGit        $instalarGit `
+        -CheckClaudeCLI  $instalarClaudeCLI `
+        -CheckCodexCLI   $instalarCodexCLI `
+        -CheckOpenCode   $instalarOpenCode `
+        -CheckClaudeDesk $instalarClaudeDesk `
+        -CheckCodexDesk  $instalarCodexDesk `
+        -CheckOpenDesk   $instalarOpenDesk `
+        -RecordFailures
 }
 
 # ----------------------------------------------------------
