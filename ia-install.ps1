@@ -3971,7 +3971,10 @@ function Install-ClaudeCodeNative {
             throw "A resposta recebida nao parece ser o instalador PowerShell do Claude Code."
         }
 
-        $windowsPowerShell = Get-Command powershell.exe -ErrorAction Stop
+        $windowsPowerShell = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $windowsPowerShell) {
+            $windowsPowerShell = Get-Command powershell.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        }
         Write-Step "Executando o instalador nativo no perfil '$($u.Username)'..."
         $proc = Start-Process -FilePath $windowsPowerShell.Source `
             -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$installerPath`"") `

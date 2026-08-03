@@ -122,7 +122,7 @@ function Request-Elevation {
     if ($InternalEngine) { $argList += '-InternalEngine' }
     if ($UnifiedController) { $argList += '-UnifiedController' }
 
-    $shellPath = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $shellPath = Get-PreferredPowerShellPath
     $argumentString = Join-ArgumentList -Arguments $argList
     $terminalPath = $null
     try { $terminalPath = (Get-Command wt.exe -ErrorAction Stop).Source } catch { }
@@ -176,6 +176,12 @@ function Get-UnifiedInstalledEditions {
         } catch { }
     }
     return $found
+}
+
+function Get-PreferredPowerShellPath {
+    $pwsh = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pwsh -and $pwsh.Source) { return $pwsh.Source }
+    return (Get-Command powershell.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 }
 
 function Test-UnifiedVSCodeInstalled {
@@ -314,7 +320,7 @@ function Invoke-UnifiedHiddenEngine {
     $safeLabel = $Label -replace '[^a-zA-Z0-9_-]', '-'
     $stdout = Join-Path $logDir "Engine-$safeLabel-$stamp.stdout.log"
     $stderr = Join-Path $logDir "Engine-$safeLabel-$stamp.stderr.log"
-    $shell = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $shell = Get-PreferredPowerShellPath
     $processArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$ScriptPath) + $Arguments
     Write-Host ''
     Write-Host ('  {0}' -f $Label.ToUpperInvariant()) -ForegroundColor White
