@@ -14,7 +14,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$SCRIPT_VERSION       = '3.1.0'
+$SCRIPT_VERSION       = '3.1.1'
 $script:ExitCode       = 0
 $script:NonInteractive = $false
 $script:ThisScriptPath = $PSCommandPath
@@ -670,7 +670,11 @@ function Invoke-SoftwareManager {
         Write-Host ("  {0,-28} {1}" -f $state.Item.Name,$label) -ForegroundColor $color
     }
     Write-Host ''
-    if (-not $actions.Count) { Write-UnifiedStatus 'Conclusao' 'Todos os aplicativos estao instalados e atualizados.' Ok; return }
+    if (-not $actions.Count) {
+        Write-UnifiedStatus 'Conclusao' 'Todos os aplicativos estao instalados e atualizados.' Ok
+        if (-not $script:NonInteractive) { Write-Host ''; $null = Read-Host '  Pressione ENTER para voltar ao Infinity Hub' }
+        return
+    }
     Write-Host '  ACOES DISPONIVEIS' -ForegroundColor White
     for ($i=0; $i -lt $actions.Count; $i++) {
         $verb = if ($actions[$i].Installed) { 'Atualizar' } else { 'Instalar' }
@@ -683,16 +687,52 @@ function Invoke-SoftwareManager {
     $selected = if ($answer -match '^(?i)a$') { @($actions) } else {
         @($answer -split '[,; ]+' | ForEach-Object { $n=0; if ([int]::TryParse($_,[ref]$n) -and $n -ge 1 -and $n -le $actions.Count) { $actions[$n-1] } })
     }
+    if (-not $selected.Count) {
+        Write-UnifiedStatus 'Selecao' 'Nenhuma opcao valida foi informada.' Warn
+        if (-not $script:NonInteractive) { Write-Host ''; $null = Read-Host '  Pressione ENTER para voltar ao Infinity Hub' }
+        return
+    }
     foreach ($state in $selected) {
         $verb = if ($state.Installed) { 'Atualizando' } else { 'Instalando' }
         Write-UnifiedStatus $state.Item.Name $verb
         if (Invoke-SoftwareAction $state) { Write-UnifiedStatus $state.Item.Name 'Concluido.' Ok }
         else { Write-UnifiedStatus $state.Item.Name 'Falha no processamento.' Error; $script:ExitCode=1 }
     }
+
+    Write-Host ''
+    Write-Host '  VALIDACAO FINAL' -ForegroundColor White
+    Write-UnifiedStatus 'Diagnostico' 'Atualizando PATH e conferindo o estado final...'
+    $machinePath = [Environment]::GetEnvironmentVariable('Path','Machine')
+    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+    $env:Path = (@($machinePath,$userPath) | Where-Object { $_ }) -join ';'
+    $script:WingetListText = (& winget.exe list --accept-source-agreements --disable-interactivity 2>&1 | Out-String)
+    $script:WingetUpgradeText = (& winget.exe upgrade --accept-source-agreements --disable-interactivity 2>&1 | Out-String)
+    $finalStates = @(Get-SoftwareCatalog | ForEach-Object { Get-SoftwareState $_ })
+    $pendingCount = 0
+    foreach ($final in $finalStates) {
+        if (-not $final.Installed) { $label='Nao instalado'; $color='Yellow' }
+        elseif ($final.UpdateAvailable) { $label='Atualizacao ainda disponivel'; $color='Yellow' }
+        else { $label='Instalado e atualizado'; $color='Green' }
+        if ($final.Item.Key -in @($selected | ForEach-Object { $_.Item.Key }) -and ($label -ne 'Instalado e atualizado')) { $pendingCount++ }
+        Write-Host ("  {0,-28} {1}" -f $final.Item.Name,$label) -ForegroundColor $color
+    }
+    Write-Host ''
+    if ($pendingCount -eq 0 -and $script:ExitCode -eq 0) {
+        Write-UnifiedStatus 'Conclusao' 'Todas as acoes selecionadas foram validadas.' Ok
+    } else {
+        Write-UnifiedStatus 'Conclusao' ("Existem {0} acao(oes) selecionada(s) que exigem revisao." -f $pendingCount) Warn
+        if ($pendingCount -gt 0) { $script:ExitCode = 1 }
+    }
+    if (-not $script:NonInteractive) { Write-Host ''; $null = Read-Host '  Pressione ENTER para voltar ao Infinity Hub' }
 }
 
 if (-not $InternalEngine -and -not $UnifiedController -and -not $DetectOnly) {
-    try { Invoke-SoftwareManager } catch { Write-UnifiedStatus 'Execucao' $_.Exception.Message Error; $script:ExitCode=1 }
+    try { Invoke-SoftwareManager }
+    catch {
+        Write-UnifiedStatus 'Execucao' $_.Exception.Message Error
+        $script:ExitCode=1
+        if (-not $script:NonInteractive) { Write-Host ''; $null = Read-Host '  Pressione ENTER para voltar ao Infinity Hub' }
+    }
     exit $script:ExitCode
 }
 
