@@ -49,7 +49,7 @@
     Instala somente Claude Code e Codex CLI sem prompts.
 
 .NOTES
-    Versao: 2.11.4
+    Versao: 2.11.5
     Compatibilidade: Windows 10 1809+/11, Server 2019+, PowerShell 5.1+
 #>
 [CmdletBinding(DefaultParameterSetName='Interactive', SupportsShouldProcess=$true)]
@@ -67,6 +67,9 @@ param(
     [ValidateSet('Git','ClaudeCLI','CodexCLI','OpenCode','ClaudeDesk','CodexDesk','OpenDesk')]
     [string[]]$Pacotes,
 
+    [Parameter(ParameterSetName='PacotesCsv')]
+    [string]$PacotesCsv,
+
     # Quando combinado com -Pacotes ou -Tudo/-CLI/-Desktop, remove em vez de instalar
     [switch]$Remover,
 
@@ -78,6 +81,13 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+
+if (-not [string]::IsNullOrWhiteSpace($PacotesCsv)) {
+    $Pacotes = @($PacotesCsv -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $allowedPackages = @('Git','ClaudeCLI','CodexCLI','OpenCode','ClaudeDesk','CodexDesk','OpenDesk')
+    $invalidPackages = @($Pacotes | Where-Object { $_ -notin $allowedPackages })
+    if ($invalidPackages.Count) { throw "Pacote(s) invalido(s): $($invalidPackages -join ', ')" }
+}
 
 # Modo nao-interativo? Detecta via switch ou ausencia de host interativo
 $script:NonInteractive = $Silent.IsPresent -or
@@ -104,9 +114,10 @@ if ($LogPath -or ($Silent -and -not $LogPath)) {
 # ----------------------------------------------------------
 # Versao e Historico de Atualizacoes
 # ----------------------------------------------------------
-$SCRIPT_VERSION = "2.11.4"
+$SCRIPT_VERSION = "2.11.5"
 $SCRIPT_DATA    = "03/08/2026"
 $CHANGELOG = @(
+    [PSCustomObject]@{ Versao = "2.11.5"; Data = "03/08/2026"; Descricao = "Integracao: aceita PacotesCsv para transportar varias selecoes com seguranca entre processos" }
     [PSCustomObject]@{ Versao = "2.11.4"; Data = "03/08/2026"; Descricao = "Claude Code: cria e valida shim no WindowsApps do usuario para garantir o comando em novos terminais" }
     [PSCustomObject]@{ Versao = "2.11.3"; Data = "03/08/2026"; Descricao = "Seguranca: remove -EncodedCommand dos testes de inicializacao para evitar alertas comportamentais do antivirus" }
     [PSCustomObject]@{ Versao = "2.11.2"; Data = "03/08/2026"; Descricao = "Auditoria: confirma os metodos oficiais atuais de Claude, Codex, OpenCode, Node.js e Git" }

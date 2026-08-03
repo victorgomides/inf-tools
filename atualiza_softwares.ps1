@@ -14,7 +14,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$SCRIPT_VERSION       = '3.1.2'
+$SCRIPT_VERSION       = '3.1.3'
 $script:ExitCode       = 0
 $script:NonInteractive = $false
 $script:ThisScriptPath = $PSCommandPath
@@ -561,7 +561,7 @@ function Get-SoftwareCatalog {
     return @(
         [pscustomobject]@{ Key='PowerShell7'; Name='PowerShell 7'; Ids=@('Microsoft.PowerShell','Microsoft.PowerShell.MSIX'); Command='pwsh.exe'; Ia=$null; Scope='user' }
         [pscustomobject]@{ Key='Chrome'; Name='Google Chrome'; Ids=@('Google.Chrome','Google.Chrome.EXE','Google.Chrome.Beta.EXE','Google.Chrome.Beta','Google.Chrome.Dev.EXE'); Command=''; Ia=$null; Scope='user' }
-        [pscustomobject]@{ Key='Git'; Name='Git for Windows'; Ids=@('Git.Git'); Command='git.exe'; Ia=$null; Scope='user' }
+        [pscustomobject]@{ Key='Git'; Name='Git for Windows'; Ids=@('Git.Git'); Command='git.exe'; Ia='Git'; Scope='user' }
         [pscustomobject]@{ Key='NodeJS'; Name='Node.js LTS'; Ids=@('OpenJS.NodeJS.LTS'); Command='node.exe'; Ia=$null; Scope='user' }
         [pscustomobject]@{ Key='VSCode'; Name='Visual Studio Code'; Ids=@('Microsoft.VisualStudioCode'); Command='code.cmd'; Ia=$null; Scope='user' }
         [pscustomobject]@{ Key='VisualStudio'; Name='Visual Studio Community'; Ids=@('Microsoft.VisualStudio.2022.Community'); Command=''; Ia=$null; Scope='' }
@@ -640,7 +640,7 @@ function Invoke-SoftwareAction {
     if ($item.Ia) {
         $engine = Get-TemporaryIaEngine
         $shell = if (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { 'pwsh.exe' } else { 'powershell.exe' }
-        & $shell -NoLogo -NoProfile -File $engine -Pacotes ($item.Ia -split ',') -Silent 2>&1 | ForEach-Object { Write-Host $_ }
+        & $shell -NoLogo -NoProfile -File $engine -PacotesCsv $item.Ia -Silent 2>&1 | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) { return $false }
         $env:Path = (@([Environment]::GetEnvironmentVariable('Path','Machine'),[Environment]::GetEnvironmentVariable('Path','User')) | Where-Object { $_ }) -join ';'
         $command = Get-Command $item.Command -ErrorAction SilentlyContinue | Select-Object -First 1
