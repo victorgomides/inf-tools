@@ -49,7 +49,7 @@
     Instala somente Claude Code e Codex CLI sem prompts.
 
 .NOTES
-    Versao: 2.11.1
+    Versao: 2.11.2
     Compatibilidade: Windows 10 1809+/11, Server 2019+, PowerShell 5.1+
 #>
 [CmdletBinding(DefaultParameterSetName='Interactive', SupportsShouldProcess=$true)]
@@ -104,9 +104,12 @@ if ($LogPath -or ($Silent -and -not $LogPath)) {
 # ----------------------------------------------------------
 # Versao e Historico de Atualizacoes
 # ----------------------------------------------------------
-$SCRIPT_VERSION = "2.11.1"
+$SCRIPT_VERSION = "2.11.2"
 $SCRIPT_DATA    = "03/08/2026"
 $CHANGELOG = @(
+    [PSCustomObject]@{ Versao = "2.11.2"; Data = "03/08/2026"; Descricao = "Auditoria: confirma os metodos oficiais atuais de Claude, Codex, OpenCode, Node.js e Git" }
+    [PSCustomObject]@{ Versao = "2.11.2"; Data = "03/08/2026"; Descricao = "OpenCode Desktop: adiciona fallback pelo instalador oficial do GitHub quando o WinGet falhar" }
+    [PSCustomObject]@{ Versao = "2.11.2"; Data = "03/08/2026"; Descricao = "Diagnostico: alerta sobre registros duplicados dos aplicativos Desktop no WinGet" }
     [PSCustomObject]@{ Versao = "2.11.1"; Data = "03/08/2026"; Descricao = "Diagnostico: detecta e repara PATH/PATHEXT, shims PowerShell, npm prefix/cache e permissoes do perfil" }
     [PSCustomObject]@{ Versao = "2.11.1"; Data = "03/08/2026"; Descricao = "Inicializacao: testa cada CLI em processo isolado e aponta conflitos entre instalacoes" }
     [PSCustomObject]@{ Versao = "2.11.1"; Data = "03/08/2026"; Descricao = "Claude Code: CLAUDE_CODE_GIT_BASH_PATH passa a apontar corretamente para o executavel bash.exe" }
@@ -1007,6 +1010,8 @@ function Get-OpenCodeDesktopInfo {
     param([bool]$WingetOk = $false)
     $u = Get-UsuarioInterativo
     Get-DesktopToolInfo -DisplayName 'OpenCode' -WingetIds @('SST.OpenCodeDesktop') -NamePatterns @('(?i)(OpenCode|SST\.OpenCodeDesktop)') -AppxPatterns @('(?i)OpenCode') -ExePatterns @('*opencode*.exe') -FolderCandidates @(
+        "$($u.LocalAppData)\OpenCode",
+        "$env:LOCALAPPDATA\OpenCode",
         "$($u.LocalAppData)\Programs\OpenCode",
         "$env:LOCALAPPDATA\Programs\OpenCode",
         "$env:ProgramFiles\OpenCode",
@@ -2407,6 +2412,28 @@ function Invoke-StartupHealthCheck {
     }
 
     if ($CheckClaudeDesk -or $CheckCodexDesk -or $CheckOpenDesk) {
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            $desktopWingetDefs = @(
+                [PSCustomObject]@{ Enabled = $CheckClaudeDesk; Tool = 'Claude Desktop'; Id = 'Anthropic.Claude' },
+                [PSCustomObject]@{ Enabled = $CheckCodexDesk;  Tool = 'ChatGPT/Codex Desktop'; Id = '9PLM9XGG6VKS' },
+                [PSCustomObject]@{ Enabled = $CheckOpenDesk;   Tool = 'OpenCode Desktop'; Id = 'SST.OpenCodeDesktop' }
+            )
+            foreach ($desktop in $desktopWingetDefs) {
+                if (-not $desktop.Enabled) { continue }
+                try {
+                    $listLines = @(& winget list --id $desktop.Id --exact --accept-source-agreements --disable-interactivity 2>&1)
+                    $matchingRows = @($listLines | Where-Object { $_ -match [regex]::Escape($desktop.Id) })
+                    if ($matchingRows.Count -gt 1) {
+                        [void]$findings.Add([PSCustomObject]@{
+                            Tool = $desktop.Tool
+                            Critical = $false
+                            Message = "O WinGet encontrou $($matchingRows.Count) registros com o mesmo ID $($desktop.Id). Uma versao antiga pode permanecer registrada e confundir atualizacoes."
+                        })
+                    }
+                } catch { }
+            }
+        }
+
         try {
             $appxPatterns = New-Object System.Collections.Generic.List[string]
             if ($CheckClaudeDesk) { [void]$appxPatterns.Add('(?i)Claude') }
@@ -4146,6 +4173,85 @@ if ($instalarCodexDesk) {
 # ============================================================
 # 5b. OPENCODE DESKTOP
 # ============================================================
+function Install-OpenCodeDesktopOfficial {
+    [CmdletBinding()]
+    param()
+
+    $u = Get-UsuarioInterativo
+    if ($u.ElevadoComOutroUsr) {
+        Write-Fail "OpenCode Desktop deve ser instalado na sessao do proprio usuario."
+        return $false
+    }
+
+    $windowsArch = if ($env:PROCESSOR_ARCHITEW6432) {
+        $env:PROCESSOR_ARCHITEW6432
+    } else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+    $packageArch = switch ($windowsArch.ToUpperInvariant()) {
+        'AMD64' { 'x64' }
+        'ARM64' { 'arm64' }
+        default { $null }
+    }
+    if (-not $packageArch) {
+        Write-Fail "Arquitetura do Windows nao suportada pelo OpenCode Desktop: $windowsArch"
+        return $false
+    }
+
+    $installerPath = Join-Path $env:TEMP "opencode-desktop-$packageArch.exe"
+    try {
+        Write-Step "Consultando a versao oficial mais recente do OpenCode Desktop..."
+        $release = Invoke-RestMethod 'https://api.github.com/repos/anomalyco/opencode/releases/latest' `
+            -Headers @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'inf-tools-ia-install' } `
+            -ErrorAction Stop
+        $assetPattern = "^opencode-desktop-(?:win|windows)-$packageArch\.exe$"
+        $asset = $release.assets | Where-Object { $_.name -match $assetPattern } | Select-Object -First 1
+        if (-not $asset) {
+            throw "A release $($release.tag_name) nao possui instalador Windows $packageArch."
+        }
+
+        Write-Step "Baixando $($asset.name) da release oficial $($release.tag_name)..."
+        $ok = Invoke-FastDownload -Url $asset.browser_download_url -OutFile $installerPath -Label "OpenCode Desktop"
+        if (-not $ok -or -not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+            throw "O download do instalador oficial nao foi concluido."
+        }
+
+        $stream = [System.IO.File]::OpenRead($installerPath)
+        try {
+            $byte1 = $stream.ReadByte()
+            $byte2 = $stream.ReadByte()
+        } finally {
+            $stream.Dispose()
+        }
+        if ($byte1 -ne 0x4D -or $byte2 -ne 0x5A) {
+            throw "O arquivo baixado nao possui uma assinatura executavel valida."
+        }
+
+        Write-Step "Instalando OpenCode Desktop no perfil do usuario..."
+        $proc = Start-Process -FilePath $installerPath -ArgumentList @('/S') `
+            -Wait -PassThru -ErrorAction Stop
+        if ($proc.ExitCode -ne 0) {
+            throw "O instalador encerrou com o codigo $($proc.ExitCode)."
+        }
+
+        $installedInfo = Get-OpenCodeDesktopInfo -WingetOk $false
+        if (-not $installedInfo.Installed) {
+            throw "A instalacao terminou, mas o OpenCode Desktop nao foi detectado."
+        }
+
+        Write-Ok "OpenCode Desktop instalado com sucesso pelo pacote oficial."
+        Write-Ok "Procure por 'OpenCode' no Menu Iniciar para abrir o app."
+        return $true
+    } catch {
+        Set-OperationFailure -Name 'OpenCode Desktop' -Reason $_.Exception.Message
+        Write-Fail "Falha no instalador oficial do OpenCode Desktop: $($_.Exception.Message)"
+        Write-Warn "Baixe manualmente em: https://opencode.ai/download"
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if ($instalarOpenDesk) {
     Write-Phase "OpenCode Desktop"
 
@@ -4168,8 +4274,9 @@ if ($instalarOpenDesk) {
                 if (Test-WingetUpgradeAvailable -Id 'SST.OpenCodeDesktop') { throw "A atualizacao continua pendente depois da execucao do WinGet." }
                 Write-Ok "Verificacao do OpenCode Desktop concluida."
             } catch {
-                Set-OperationFailure -Name 'OpenCode Desktop' -Reason $_.Exception.Message
                 Write-Warn "Nao foi possivel verificar atualizacoes: $_"
+                Write-Step "Tentando o instalador oficial mais recente..."
+                $null = Install-OpenCodeDesktopOfficial
             }
         }
         Pause-Readable 3
@@ -4186,14 +4293,14 @@ if ($instalarOpenDesk) {
             Write-Ok "Procure por 'OpenCode' no Menu Iniciar para abrir o app."
             Pause-Readable 3
         } catch {
-            Set-OperationFailure -Name 'OpenCode Desktop' -Reason $_.Exception.Message
-            Write-Fail "Falha ao instalar OpenCode Desktop: $_"
-            Write-Warn "Acesse: https://opencode.ai para instalar manualmente."
+            Write-Warn "Falha ao instalar OpenCode Desktop via WinGet: $_"
+            Write-Step "Tentando o instalador oficial mais recente..."
+            $null = Install-OpenCodeDesktopOfficial
             Pause-Readable 4
         }
     } else {
-        Write-Warn "winget nao disponivel. Instale o OpenCode Desktop manualmente."
-        Write-Host "  Acesse: https://opencode.ai" -ForegroundColor Cyan
+        Write-Warn "winget nao disponivel. Usando o instalador oficial do OpenCode Desktop."
+        $null = Install-OpenCodeDesktopOfficial
         Pause-Readable 3
     }
 }
