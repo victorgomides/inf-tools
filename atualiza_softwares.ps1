@@ -14,7 +14,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$SCRIPT_VERSION       = '3.1.3'
+$SCRIPT_VERSION       = '3.1.4'
 $script:ExitCode       = 0
 $script:NonInteractive = $false
 $script:ThisScriptPath = $PSCommandPath
@@ -566,9 +566,6 @@ function Get-SoftwareCatalog {
         [pscustomobject]@{ Key='VSCode'; Name='Visual Studio Code'; Ids=@('Microsoft.VisualStudioCode'); Command='code.cmd'; Ia=$null; Scope='user' }
         [pscustomobject]@{ Key='VisualStudio'; Name='Visual Studio Community'; Ids=@('Microsoft.VisualStudio.2022.Community'); Command=''; Ia=$null; Scope='' }
         [pscustomobject]@{ Key='PowerBI'; Name='Power BI Desktop'; Ids=@('Microsoft.PowerBI'); Command=''; Ia=$null; Scope='' }
-        [pscustomobject]@{ Key='Claude'; Name='Claude'; Ids=@(); Command='claude.cmd'; Ia='ClaudeCLI,ClaudeDesk'; Scope='user' }
-        [pscustomobject]@{ Key='Codex'; Name='Codex'; Ids=@(); Command='codex.cmd'; Ia='CodexCLI,CodexDesk'; Scope='user' }
-        [pscustomobject]@{ Key='OpenCode'; Name='OpenCode'; Ids=@(); Command='opencode.cmd'; Ia='OpenCode,OpenDesk'; Scope='user' }
     )
 }
 
@@ -610,7 +607,7 @@ function Get-SoftwareState {
     if ($installed -and $id) {
         $update = ($script:WingetUpgradeText -and $script:WingetUpgradeText -match [regex]::Escape($id))
     }
-    elseif ($installed -and $Item.Ia -and $Item.Command) {
+    elseif ($installed -and $Item.Key -in @('Claude','Codex','OpenCode') -and $Item.Command) {
         try {
             $package = switch ($Item.Key) { 'Claude' {'@anthropic-ai/claude-code'}; 'Codex' {'@openai/codex'}; 'OpenCode' {'opencode-ai'} }
             $currentText = & $Item.Command --version 2>$null | Select-Object -First 1
