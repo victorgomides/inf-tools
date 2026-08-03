@@ -49,7 +49,7 @@
     Instala somente Claude Code e Codex CLI sem prompts.
 
 .NOTES
-    Versao: 2.11.3
+    Versao: 2.11.4
     Compatibilidade: Windows 10 1809+/11, Server 2019+, PowerShell 5.1+
 #>
 [CmdletBinding(DefaultParameterSetName='Interactive', SupportsShouldProcess=$true)]
@@ -104,9 +104,10 @@ if ($LogPath -or ($Silent -and -not $LogPath)) {
 # ----------------------------------------------------------
 # Versao e Historico de Atualizacoes
 # ----------------------------------------------------------
-$SCRIPT_VERSION = "2.11.3"
+$SCRIPT_VERSION = "2.11.4"
 $SCRIPT_DATA    = "03/08/2026"
 $CHANGELOG = @(
+    [PSCustomObject]@{ Versao = "2.11.4"; Data = "03/08/2026"; Descricao = "Claude Code: cria e valida shim no WindowsApps do usuario para garantir o comando em novos terminais" }
     [PSCustomObject]@{ Versao = "2.11.3"; Data = "03/08/2026"; Descricao = "Seguranca: remove -EncodedCommand dos testes de inicializacao para evitar alertas comportamentais do antivirus" }
     [PSCustomObject]@{ Versao = "2.11.2"; Data = "03/08/2026"; Descricao = "Auditoria: confirma os metodos oficiais atuais de Claude, Codex, OpenCode, Node.js e Git" }
     [PSCustomObject]@{ Versao = "2.11.2"; Data = "03/08/2026"; Descricao = "OpenCode Desktop: adiciona fallback pelo instalador oficial do GitHub quando o WinGet falhar" }
@@ -3951,6 +3952,31 @@ function Install-ClaudeDesktopMsix {
     }
 }
 
+function Ensure-UserCommandShim {
+    param(
+        [Parameter(Mandatory=$true)][string]$CommandName,
+        [Parameter(Mandatory=$true)][string]$Source,
+        [Parameter(Mandatory=$true)]$UserInfo
+    )
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "Executavel de origem nao localizado: $Source" }
+    $windowsApps = Join-Path $UserInfo.LocalAppData 'Microsoft\WindowsApps'
+    if (-not (Test-Path -LiteralPath $windowsApps -PathType Container)) { New-Item -ItemType Directory -Path $windowsApps -Force | Out-Null }
+    $shim = Join-Path $windowsApps ($CommandName + '.cmd')
+    if ((ConvertTo-NormalizedPathEntry $Source) -ne (ConvertTo-NormalizedPathEntry $shim)) {
+        $escapedSource = $Source.Replace('%','%%')
+        $shimContent = "@echo off`r`n`"$escapedSource`" %*`r`n"
+        [IO.File]::WriteAllText($shim,$shimContent,[Text.Encoding]::ASCII)
+    }
+    $null = Set-UserEnvVar -Name 'Path' -Value $windowsApps -Append
+    if ($env:Path -notlike "*$windowsApps*") { $env:Path = "$windowsApps;$env:Path" }
+    $null = Broadcast-EnvChange
+    $probe = Invoke-PowerShellCommandProbe -CommandName $shim
+    if (-not $probe.Success -or [string]::IsNullOrWhiteSpace($probe.Output)) {
+        throw "O comando '$CommandName' falhou no teste pelo shim: $($probe.Error)"
+    }
+    return $shim
+}
+
 function Install-ClaudeCodeNative {
     $u = Get-UsuarioInterativo
     if ($u.ElevadoComOutroUsr) {
@@ -3992,7 +4018,9 @@ function Install-ClaudeCodeNative {
             throw "A instalacao terminou, mas o comando claude nao foi detectado."
         }
 
-        Write-Ok "Claude Code instalado/atualizado em escopo de usuario."
+        $claudeShim = Ensure-UserCommandShim -CommandName 'claude' -Source ([string]$installed.Source) -UserInfo $u
+
+        Write-Ok "Claude Code instalado/atualizado e comando validado: $claudeShim"
         return $true
     } catch {
         Set-OperationFailure -Name 'Claude Code' -Reason $_.Exception.Message
@@ -4103,6 +4131,17 @@ if ($instalarClaudeCLI) {
     } else {
         Write-Step "Claude Code nao encontrado. Instalando pelo metodo nativo oficial..."
         $null = Install-ClaudeCodeNative
+    }
+    $claudeFinalForShim = Get-CliToolInfo -Cmd 'claude' -NpmPackage '@anthropic-ai/claude-code'
+    if ($claudeFinalForShim.Installed -and $claudeFinalForShim.Source) {
+        try {
+            $claudeUser = Get-UsuarioInterativo
+            $validatedShim = Ensure-UserCommandShim -CommandName 'claude' -Source ([string]$claudeFinalForShim.Source) -UserInfo $claudeUser
+            Write-Ok "Comando claude validado para novos terminais: $validatedShim"
+        } catch {
+            Set-OperationFailure -Name 'Claude Code' -Reason $_.Exception.Message
+            Write-Fail "Claude esta instalado, mas o comando nao ficou disponivel: $($_.Exception.Message)"
+        }
     }
     Pause-Readable 3
 }

@@ -14,7 +14,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$SCRIPT_VERSION       = '3.1.1'
+$SCRIPT_VERSION       = '3.1.2'
 $script:ExitCode       = 0
 $script:NonInteractive = $false
 $script:ThisScriptPath = $PSCommandPath
@@ -559,16 +559,16 @@ function Invoke-UnifiedController {
 
 function Get-SoftwareCatalog {
     return @(
-        [pscustomobject]@{ Key='PowerShell7'; Name='PowerShell 7'; Ids=@('Microsoft.PowerShell','Microsoft.PowerShell.MSIX'); Command='pwsh.exe'; Ia=$null }
-        [pscustomobject]@{ Key='Chrome'; Name='Google Chrome'; Ids=@('Google.Chrome','Google.Chrome.EXE','Google.Chrome.Beta.EXE','Google.Chrome.Beta','Google.Chrome.Dev.EXE'); Command='chrome.exe'; Ia=$null }
-        [pscustomobject]@{ Key='Git'; Name='Git for Windows'; Ids=@('Git.Git'); Command='git.exe'; Ia=$null }
-        [pscustomobject]@{ Key='NodeJS'; Name='Node.js LTS'; Ids=@('OpenJS.NodeJS.LTS'); Command='node.exe'; Ia=$null }
-        [pscustomobject]@{ Key='VSCode'; Name='Visual Studio Code'; Ids=@('Microsoft.VisualStudioCode'); Command='code.cmd'; Ia=$null }
-        [pscustomobject]@{ Key='VisualStudio'; Name='Visual Studio Community'; Ids=@('Microsoft.VisualStudio.2022.Community'); Command=''; Ia=$null }
-        [pscustomobject]@{ Key='PowerBI'; Name='Power BI Desktop'; Ids=@('Microsoft.PowerBI'); Command=''; Ia=$null }
-        [pscustomobject]@{ Key='Claude'; Name='Claude'; Ids=@(); Command='claude.cmd'; Ia='ClaudeCLI,ClaudeDesk' }
-        [pscustomobject]@{ Key='Codex'; Name='Codex'; Ids=@(); Command='codex.cmd'; Ia='CodexCLI,CodexDesk' }
-        [pscustomobject]@{ Key='OpenCode'; Name='OpenCode'; Ids=@(); Command='opencode.cmd'; Ia='OpenCode,OpenDesk' }
+        [pscustomobject]@{ Key='PowerShell7'; Name='PowerShell 7'; Ids=@('Microsoft.PowerShell','Microsoft.PowerShell.MSIX'); Command='pwsh.exe'; Ia=$null; Scope='user' }
+        [pscustomobject]@{ Key='Chrome'; Name='Google Chrome'; Ids=@('Google.Chrome','Google.Chrome.EXE','Google.Chrome.Beta.EXE','Google.Chrome.Beta','Google.Chrome.Dev.EXE'); Command=''; Ia=$null; Scope='user' }
+        [pscustomobject]@{ Key='Git'; Name='Git for Windows'; Ids=@('Git.Git'); Command='git.exe'; Ia=$null; Scope='user' }
+        [pscustomobject]@{ Key='NodeJS'; Name='Node.js LTS'; Ids=@('OpenJS.NodeJS.LTS'); Command='node.exe'; Ia=$null; Scope='user' }
+        [pscustomobject]@{ Key='VSCode'; Name='Visual Studio Code'; Ids=@('Microsoft.VisualStudioCode'); Command='code.cmd'; Ia=$null; Scope='user' }
+        [pscustomobject]@{ Key='VisualStudio'; Name='Visual Studio Community'; Ids=@('Microsoft.VisualStudio.2022.Community'); Command=''; Ia=$null; Scope='' }
+        [pscustomobject]@{ Key='PowerBI'; Name='Power BI Desktop'; Ids=@('Microsoft.PowerBI'); Command=''; Ia=$null; Scope='' }
+        [pscustomobject]@{ Key='Claude'; Name='Claude'; Ids=@(); Command='claude.cmd'; Ia='ClaudeCLI,ClaudeDesk'; Scope='user' }
+        [pscustomobject]@{ Key='Codex'; Name='Codex'; Ids=@(); Command='codex.cmd'; Ia='CodexCLI,CodexDesk'; Scope='user' }
+        [pscustomobject]@{ Key='OpenCode'; Name='OpenCode'; Ids=@(); Command='opencode.cmd'; Ia='OpenCode,OpenDesk'; Scope='user' }
     )
 }
 
@@ -640,15 +640,51 @@ function Invoke-SoftwareAction {
     if ($item.Ia) {
         $engine = Get-TemporaryIaEngine
         $shell = if (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { 'pwsh.exe' } else { 'powershell.exe' }
-        & $shell -NoLogo -NoProfile -File $engine -Pacotes ($item.Ia -split ',') -Silent
-        return ($LASTEXITCODE -eq 0)
+        & $shell -NoLogo -NoProfile -File $engine -Pacotes ($item.Ia -split ',') -Silent 2>&1 | ForEach-Object { Write-Host $_ }
+        if ($LASTEXITCODE -ne 0) { return $false }
+        $env:Path = (@([Environment]::GetEnvironmentVariable('Path','Machine'),[Environment]::GetEnvironmentVariable('Path','User')) | Where-Object { $_ }) -join ';'
+        $command = Get-Command $item.Command -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $command) { Write-UnifiedStatus $item.Name 'Instalador terminou, mas o comando nao foi encontrado no PATH.' Error; return $false }
+        try { $version = & $command.Source --version 2>&1 | Select-Object -First 1; return ($LASTEXITCODE -eq 0 -and $version) } catch { return $false }
     }
     $id = if ($State.InstalledId) { $State.InstalledId } else { $item.Ids[0] }
     $operation = if ($State.Installed) { 'upgrade' } else { 'install' }
     $args = @($operation,'--id',$id,'--exact','--silent','--accept-package-agreements','--accept-source-agreements','--disable-interactivity')
+    if ($operation -eq 'install' -and $item.Scope) { $args += @('--scope',$item.Scope) }
     if ($operation -eq 'upgrade') { $args += '--include-unknown' }
-    & winget.exe @args
-    return ($LASTEXITCODE -eq 0)
+    & winget.exe @args 2>&1 | ForEach-Object { Write-Host $_ }
+    if ($LASTEXITCODE -ne 0 -and $operation -eq 'install' -and $item.Scope) {
+        Write-UnifiedStatus $item.Name 'Instalacao por usuario indisponivel; tentando o escopo suportado pelo pacote.' Warn
+        $args = @($operation,'--id',$id,'--exact','--silent','--accept-package-agreements','--accept-source-agreements','--disable-interactivity')
+        & winget.exe @args 2>&1 | ForEach-Object { Write-Host $_ }
+    }
+    if ($LASTEXITCODE -ne 0) { return $false }
+    $env:Path = (@([Environment]::GetEnvironmentVariable('Path','Machine'),[Environment]::GetEnvironmentVariable('Path','User')) | Where-Object { $_ }) -join ';'
+    if ($item.Command) {
+        $knownPaths = switch ($item.Key) {
+            'Git' { @("$env:ProgramFiles\Git\cmd\git.exe", "$env:LOCALAPPDATA\Programs\Git\cmd\git.exe") }
+            'NodeJS' { @("$env:ProgramFiles\nodejs\node.exe", "$env:LOCALAPPDATA\Programs\nodejs\node.exe") }
+            'PowerShell7' { @("$env:ProgramFiles\PowerShell\7\pwsh.exe", "$env:LOCALAPPDATA\Microsoft\WindowsApps\pwsh.exe") }
+            'VSCode' { @("$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd", "$env:ProgramFiles\Microsoft VS Code\bin\code.cmd") }
+            default { @() }
+        }
+        $command = Get-Command $item.Command -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $command) {
+            $candidate = $knownPaths | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+            if ($candidate) {
+                $binDir = Split-Path -Parent $candidate
+                $currentUserPath = [Environment]::GetEnvironmentVariable('Path','User')
+                if (-not (($currentUserPath -split ';') -contains $binDir)) {
+                    [Environment]::SetEnvironmentVariable('Path',((@($currentUserPath,$binDir) | Where-Object { $_ }) -join ';'),'User')
+                }
+                $env:Path = "$binDir;$env:Path"
+                $command = [pscustomobject]@{ Source=$candidate }
+            }
+        }
+        if (-not $command) { Write-UnifiedStatus $item.Name 'Pacote registrado, mas executavel nao localizado.' Error; return $false }
+        try { $version = & $command.Source --version 2>&1 | Select-Object -First 1; if ($LASTEXITCODE -ne 0 -or -not $version) { return $false } } catch { return $false }
+    }
+    return (Test-SoftwareInstalled $item)
 }
 
 function Invoke-SoftwareManager {
