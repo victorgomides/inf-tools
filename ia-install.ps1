@@ -5,7 +5,8 @@
 .DESCRIPTION
     Script de instalacao/atualizacao/remocao das ferramentas de IA. Suporta:
       - Modo interativo (menu) e nao-interativo (via switches)
-      - Maquina local, Servidor e Terminal Server (TS/UAC com outro usuario)
+      - Instalacao por usuario, sem exigir privilegios administrativos
+      - Maquina local, Servidor e Terminal Server
       - PowerShell 5.1+ (Desktop e Core)
       - Console UTF-8/VT com fallback ASCII
       - Proxy do sistema, retry automatico em downloads
@@ -18,7 +19,7 @@
     Instala somente as ferramentas CLI (Claude Code, Codex CLI, OpenCode).
 
 .PARAMETER Desktop
-    Instala somente os apps Desktop (Claude, Codex, OpenCode).
+    Instala somente os apps Desktop (Claude, ChatGPT/Codex, OpenCode).
 
 .PARAMETER Pacotes
     Lista especifica de pacotes a instalar. Valores aceitos:
@@ -48,8 +49,8 @@
     Instala somente Claude Code e Codex CLI sem prompts.
 
 .NOTES
-    Versao: 2.10.9
-    Compatibilidade: Windows 10/11, Server 2016+, PowerShell 5.1+
+    Versao: 2.11.0
+    Compatibilidade: Windows 10 1809+/11, Server 2019+, PowerShell 5.1+
 #>
 [CmdletBinding(DefaultParameterSetName='Interactive', SupportsShouldProcess=$true)]
 param(
@@ -103,9 +104,13 @@ if ($LogPath -or ($Silent -and -not $LogPath)) {
 # ----------------------------------------------------------
 # Versao e Historico de Atualizacoes
 # ----------------------------------------------------------
-$SCRIPT_VERSION = "2.10.9"
+$SCRIPT_VERSION = "2.11.0"
 $SCRIPT_DATA    = "03/08/2026"
 $CHANGELOG = @(
+    [PSCustomObject]@{ Versao = "2.11.0"; Data = "03/08/2026"; Descricao = "Usuario comum: instaladores, PATH, npm e WinGet passam a usar sempre o escopo do usuario" }
+    [PSCustomObject]@{ Versao = "2.11.0"; Data = "03/08/2026"; Descricao = "Confiabilidade: valida codigos de saida e confirma cada instalacao antes de informar sucesso" }
+    [PSCustomObject]@{ Versao = "2.11.0"; Data = "03/08/2026"; Descricao = "Claude Code: usa instalador nativo atual em processo isolado, inclusive no Windows Server" }
+    [PSCustomObject]@{ Versao = "2.11.0"; Data = "03/08/2026"; Descricao = "Codex: remove instalacao preventiva do VC++ que exigia UAC; runtime fica como troubleshooting" }
     [PSCustomObject]@{ Versao = "2.10.9"; Data = "03/08/2026"; Descricao = "Claude Desktop: substitui ClaudeSetup.exe legado pelo MSIX oficial mais recente" }
     [PSCustomObject]@{ Versao = "2.10.9"; Data = "03/08/2026"; Descricao = "Claude Desktop: valida o codigo de saida do WinGet e usa fallback oficial por arquitetura" }
     [PSCustomObject]@{ Versao = "2.10.8"; Data = "06/05/2026"; Descricao = "Entrada: limpa buffer antes de confirmacoes" }
@@ -204,7 +209,6 @@ $CHANGELOG = @(
 # ----------------------------------------------------------
 # Dependencias externas
 # ----------------------------------------------------------
-$script:VC_REDIST_X64_URL = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
 
 # ----------------------------------------------------------
 # CATALOGO DE PACOTES - metadados centralizados
@@ -224,7 +228,7 @@ $script:PACKAGES = @{
     }
     'ClaudeCLI' = @{
         DisplayName  = 'Claude Code'
-        Type         = 'Npm'
+        Type         = 'Native'
         Cmd          = 'claude'
         NpmName      = '@anthropic-ai/claude-code'
         WingetId     = 'Anthropic.ClaudeCode'
@@ -254,7 +258,7 @@ $script:PACKAGES = @{
         Required     = $false
     }
     'CodexDesk' = @{
-        DisplayName  = 'Codex Desktop'
+        DisplayName  = 'ChatGPT/Codex Desktop'
         Type         = 'AppxStore'
         StoreId      = '9PLM9XGG6VKS'
         AppxName     = '*Codex*'
@@ -399,6 +403,7 @@ $script:PhaseCurrent    = 0
 $script:PhaseTotal      = 0
 $script:ScriptStartTime = $null
 $script:InstallResults  = @()  # resumo final
+$script:OperationFailures = @{}
 
 # Caracteres: usa Unicode quando suportado, ASCII como fallback (Windows 7/CMD legado/PS sem UTF-8)
 if ($script:Compat.UnicodeOk) {
@@ -456,6 +461,7 @@ function Start-Dashboard {
     $script:PhaseTotal      = $TotalPhases
     $script:ScriptStartTime = Get-Date
     $script:InstallResults  = @()
+    $script:OperationFailures = @{}
 }
 
 function Set-PreferredConsoleSize {
@@ -561,16 +567,24 @@ function Show-Spinner {
     return $result
 }
 
+function Get-NpmCommandPath {
+    try {
+        $cmd = Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cmd -and $cmd.Source) { return $cmd.Source }
+    } catch { }
+    return $null
+}
+
 function Invoke-NpmPrefixSafe {
     param([int]$TimeoutSec = 4)
 
     try {
-        $npmCmd = Get-Command npm -ErrorAction SilentlyContinue
+        $npmCmd = Get-NpmCommandPath
         if (-not $npmCmd) { return "" }
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $npmCmd.Source
-        $psi.Arguments = 'config get prefix'
+        $psi.FileName = $env:ComSpec
+        $psi.Arguments = "/d /s /c `"`"$npmCmd`" config get prefix`""
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
@@ -626,12 +640,19 @@ function Get-CliToolInfo {
 
     foreach ($candidate in ($candidates | Select-Object -Unique)) {
         if (-not (Test-Path -LiteralPath $candidate -ErrorAction SilentlyContinue)) { continue }
+        # Shims npm .ps1 normalmente terminam com 'exit', o que encerraria este
+        # instalador. O .cmd equivalente e testado antes e e seguro.
+        if ([System.IO.Path]::GetExtension($candidate) -ieq '.ps1') { continue }
 
         $version = ""
+        $commandOk = $false
         try {
             $out = & $candidate --version 2>&1 | Out-String
             $version = $out.Trim()
+            $commandOk = ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($version))
         } catch { }
+
+        if (-not $commandOk) { continue }
 
         return [PSCustomObject]@{
             Installed = $true
@@ -655,17 +676,17 @@ function Get-CliToolInfo {
             try {
                 $pkg = Get-Content -LiteralPath $packageJson -Raw -ErrorAction Stop | ConvertFrom-Json
                 return [PSCustomObject]@{
-                    Installed = $true
+                    Installed = $false
                     Version   = $pkg.version
                     Source    = $packageJson
-                    Method    = 'npm-package'
+                    Method    = 'broken-npm-package'
                 }
             } catch {
                 return [PSCustomObject]@{
-                    Installed = $true
+                    Installed = $false
                     Version   = ""
                     Source    = $packageJson
-                    Method    = 'npm-package'
+                    Method    = 'broken-npm-package'
                 }
             }
         }
@@ -685,11 +706,12 @@ function Get-CodexDesktopInfo {
     if ($WingetOk) {
         foreach ($args in @(
             @('list','--id','9PLM9XGG6VKS','--exact','--accept-source-agreements'),
+            @('list','--name','ChatGPT','--accept-source-agreements'),
             @('list','--name','Codex','--accept-source-agreements')
         )) {
             try {
                 $output = & winget @args 2>&1 | Out-String
-                if ($output -match '(?i)(9PLM9XGG6VKS|OpenAI\s+Codex|Codex)' -and
+                if ($output -match '(?i)(9PLM9XGG6VKS|OpenAI\s+Codex|ChatGPT|Codex)' -and
                     $output -notmatch '(?i)(Nenhum pacote|No installed package|No package found|Nenhum pacote encontrado)') {
                     return [PSCustomObject]@{ Installed = $true; Version = ""; Source = 'winget'; Method = ($args -join ' ') }
                 }
@@ -697,7 +719,7 @@ function Get-CodexDesktopInfo {
         }
     }
 
-    foreach ($allUsers in @($false, $true)) {
+    foreach ($allUsers in @($false)) {
         try {
             $packages = if ($allUsers) {
                 Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue
@@ -706,10 +728,10 @@ function Get-CodexDesktopInfo {
             }
 
             $pkg = $packages | Where-Object {
-                $_.Name -match '(?i)(Codex|OpenAI)' -or
-                $_.PackageFullName -match '(?i)(Codex|OpenAI)' -or
-                $_.PackageFamilyName -match '(?i)(Codex|OpenAI)' -or
-                $_.InstallLocation -match '(?i)(Codex|OpenAI)'
+                $_.Name -match '(?i)(ChatGPT|Codex|OpenAI)' -or
+                $_.PackageFullName -match '(?i)(ChatGPT|Codex|OpenAI)' -or
+                $_.PackageFamilyName -match '(?i)(ChatGPT|Codex|OpenAI)' -or
+                $_.InstallLocation -match '(?i)(ChatGPT|Codex|OpenAI)'
             } | Select-Object -First 1
 
             if ($pkg) {
@@ -720,7 +742,7 @@ function Get-CodexDesktopInfo {
 
     try {
         $startApp = Get-StartApps | Where-Object {
-            $_.Name -match '(?i)(Codex|OpenAI)' -or $_.AppID -match '(?i)(Codex|OpenAI|9PLM9XGG6VKS)'
+            $_.Name -match '(?i)(ChatGPT|Codex|OpenAI)' -or $_.AppID -match '(?i)(ChatGPT|Codex|OpenAI|9PLM9XGG6VKS)'
         } | Select-Object -First 1
         if ($startApp) {
             return [PSCustomObject]@{ Installed = $true; Version = ""; Source = $startApp.Name; Method = 'start-menu' }
@@ -783,155 +805,6 @@ function Get-CodexDesktopInfo {
 
     return [PSCustomObject]@{ Installed = $false; Version = ""; Source = ""; Method = "" }
 }
-function Get-RegPropValue {
-    param(
-        [Parameter(Mandatory=$true)]$Object,
-        [Parameter(Mandatory=$true)][string]$Name
-    )
-
-    try {
-        $prop = $Object.PSObject.Properties[$Name]
-        if ($prop) { return $prop.Value }
-    } catch { }
-    return $null
-}
-
-function Get-VcRedistX64 {
-    $regRoots = @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-    )
-
-    $items = foreach ($root in $regRoots) {
-        $entries = Get-ItemProperty -Path $root -ErrorAction SilentlyContinue
-        foreach ($entry in $entries) {
-            $name = Get-RegPropValue -Object $entry -Name 'DisplayName'
-            if ([string]::IsNullOrWhiteSpace($name)) { continue }
-
-            if ($name -match 'Microsoft Visual C\+\+.*Redistributable' -and
-                $name -match '(x64|64-bit)' -and
-                $name -match '(2015|2017|2019|2022|2015-2022)') {
-                $version = Get-RegPropValue -Object $entry -Name 'DisplayVersion'
-                [PSCustomObject]@{
-                    DisplayName    = $name
-                    DisplayVersion = $version
-                    RegistryPath   = Get-RegPropValue -Object $entry -Name 'PSPath'
-                }
-            }
-        }
-    }
-
-    $items |
-        Sort-Object @{ Expression = {
-            try { [version]$_.DisplayVersion } catch { [version]'0.0.0.0' }
-        }; Descending = $true } |
-        Select-Object -First 1
-}
-
-
-function Convert-ToVersionSafe {
-    param([string]$Value)
-
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    $match = [regex]::Match($Value, '\d+(\.\d+){1,3}')
-    if (-not $match.Success) { return $null }
-
-    try { return [version]$match.Value } catch { return $null }
-}
-
-function Get-FileVersionSafe {
-    param([Parameter(Mandatory=$true)][string]$Path)
-
-    try {
-        $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
-        foreach ($candidate in @($info.ProductVersion, $info.FileVersion)) {
-            $version = Convert-ToVersionSafe -Value $candidate
-            if ($version) { return $version }
-        }
-    } catch { }
-    return $null
-}
-
-function Ensure-VcRedistX64 {
-    Write-Phase "Visual C++ Redistributable x64"
-    Write-Step "Verificando pre-requisito do Codex CLI/Desktop..."
-
-    $installed = Get-VcRedistX64
-    $installedVersion = $null
-    if ($installed) {
-        $installedVersion = Convert-ToVersionSafe -Value $installed.DisplayVersion
-        $versionText = if ($installed.DisplayVersion) { " $($installed.DisplayVersion)" } else { "" }
-        Write-Ok "Visual C++ Redistributable x64 encontrado$versionText."
-    } else {
-        Write-Warn "Visual C++ Redistributable x64 nao encontrado. O Codex pode precisar dele para funcionar."
-    }
-
-    if (-not (Test-IsAdmin)) {
-        Write-Warn "A instalacao/atualizacao pode solicitar elevacao UAC."
-    }
-
-    $tempDir = Join-Path $env:TEMP "ia-install"
-    $installer = Join-Path $tempDir "vc_redist.x64.exe"
-
-    try {
-        if (-not (Test-Path -LiteralPath $tempDir -ErrorAction SilentlyContinue)) {
-            New-Item -ItemType Directory -Path $tempDir -Force -ErrorAction Stop | Out-Null
-        }
-
-        Write-Step "Baixando Visual C++ Redistributable x64 mais recente..."
-        $null = Invoke-FastDownload -Url $script:VC_REDIST_X64_URL -OutFile $installer -Label "VC++ Redistributable x64"
-
-        $latestVersion = Get-FileVersionSafe -Path $installer
-        if ($latestVersion) {
-            Write-Ok "Versao disponivel : $latestVersion"
-        } else {
-            Write-Warn "Nao foi possivel ler a versao do instalador baixado. Prosseguindo em modo de reparo/verificacao."
-        }
-
-        if ($installed -and $installedVersion -and $latestVersion -and $installedVersion -ge $latestVersion) {
-            Write-Ok "Visual C++ Redistributable x64 ja esta atualizado."
-            Add-InstallResult -Nome "VC++ Redistributable x64" -Status "OK" -Versao $installed.DisplayVersion -Obs "pre-requisito Codex"
-            Pause-Readable 2
-            return $true
-        }
-
-        if ($installed -and $installedVersion -and $latestVersion) {
-            Write-Warn "Atualizacao disponivel: $installedVersion -> $latestVersion"
-        }
-
-        Write-Step "Instalando/atualizando Visual C++ Redistributable x64..."
-        $proc = Start-Process -FilePath $installer -ArgumentList @('/install','/quiet','/norestart') -Wait -PassThru -ErrorAction Stop
-        $okExitCodes = @(0, 3010, 1638)
-
-        if ($proc.ExitCode -in $okExitCodes) {
-            $after = Get-VcRedistX64
-            $versionAfter = if ($after) { $after.DisplayVersion } else { "" }
-            Write-Ok "Visual C++ Redistributable x64 instalado/verificado."
-            if ($proc.ExitCode -eq 3010) { Write-Warn "Reinicio recomendado pelo instalador do VC++." }
-            if ($proc.ExitCode -eq 1638) { Write-Ok "Uma versao igual ou mais nova ja estava instalada." }
-            Add-InstallResult -Nome "VC++ Redistributable x64" -Status "OK" -Versao $versionAfter -Obs "pre-requisito Codex"
-            Pause-Readable 2
-            return $true
-        }
-
-        Write-Fail "Falha ao instalar Visual C++ Redistributable x64. ExitCode: $($proc.ExitCode)"
-        Add-InstallResult -Nome "VC++ Redistributable x64" -Status "FALHOU" -Obs "ExitCode $($proc.ExitCode)"
-        Pause-Readable 3
-        return $false
-    } catch {
-        Write-Fail "Falha ao instalar Visual C++ Redistributable x64: $($_.Exception.Message)"
-        Add-InstallResult -Nome "VC++ Redistributable x64" -Status "FALHOU" -Obs $_.Exception.Message
-        Pause-Readable 3
-        return $false
-    } finally {
-        try {
-            if (Test-Path -LiteralPath $installer -ErrorAction SilentlyContinue) {
-                Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
-            }
-        } catch { }
-    }
-}
-
 function Get-DesktopToolInfo {
     param(
         [string]$DisplayName,
@@ -967,7 +840,7 @@ function Get-DesktopToolInfo {
         }
     }
 
-    foreach ($allUsers in @($false, $true)) {
+    foreach ($allUsers in @($false)) {
         try {
             $packages = if ($allUsers) { Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue } else { Get-AppxPackage -ErrorAction SilentlyContinue }
             foreach ($pattern in $AppxPatterns) {
@@ -1059,6 +932,23 @@ function Get-OpenCodeDesktopInfo {
         "${env:ProgramFiles(x86)}\OpenCode"
     ) -WingetOk $WingetOk
 }
+
+function Test-WingetUpgradeAvailable {
+    param(
+        [Parameter(Mandatory=$true)][string]$Id,
+        [string]$Source = ""
+    )
+
+    try {
+        $args = @('list','--id',$Id,'--exact','--upgrade-available','--include-unknown','--accept-source-agreements','--disable-interactivity')
+        if (-not [string]::IsNullOrWhiteSpace($Source)) { $args += @('--source',$Source) }
+        $output = & winget @args 2>&1 | Out-String
+        return ($output -match [regex]::Escape($Id))
+    } catch {
+        return $false
+    }
+}
+
 function Add-InstallResult {
     param(
         [string]$Nome,
@@ -1074,6 +964,20 @@ function Add-InstallResult {
         Local   = $Local
         Obs     = $Obs
     }
+}
+
+function Set-OperationFailure {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string]$Reason
+    )
+    $script:OperationFailures[$Name] = $Reason
+}
+
+function Get-OperationFailure {
+    param([Parameter(Mandatory=$true)][string]$Name)
+    if ($script:OperationFailures.ContainsKey($Name)) { return $script:OperationFailures[$Name] }
+    return $null
 }
 
 function Show-Summary {
@@ -1462,8 +1366,11 @@ function Get-UsuarioInterativo {
     }
 
     try {
-        # Descobre o dono da sessao interativa via explorer.exe
-        $procs = Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop
+        # Considera somente o Explorer da mesma sessao do processo. Em Terminal
+        # Server podem existir varios explorer.exe; usar o primeiro apontaria
+        # instalacoes e PATH para outro usuario conectado.
+        $currentSessionId = (Get-Process -Id $PID -ErrorAction Stop).SessionId
+        $procs = Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe' AND SessionId=$currentSessionId" -ErrorAction Stop
         foreach ($p in $procs) {
             try {
                 $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
@@ -1471,7 +1378,6 @@ function Get-UsuarioInterativo {
                 $owner = $null
             }
             if ($owner -and $owner.User -and $owner.ReturnValue -eq 0) {
-                # Preferencia pela primeira sessao interativa (consola) se houver varias
                 $realUser   = $owner.User
                 $realDomain = $owner.Domain
                 if ($realUser -and $realUser -ne $env:USERNAME) {
@@ -1707,11 +1613,11 @@ function Test-NpmDisponivel {
             $env:Path = "$p;$env:Path"
         }
     }
-    $cmd = Get-Command npm -ErrorAction SilentlyContinue
+    $cmd = Get-NpmCommandPath
     if (-not $cmd) { return $false }
     # Confirma executando (pode existir .cmd quebrado)
     try {
-        $out = & $cmd.Source --version 2>$null
+        $out = & $cmd --version 2>$null
         return ($LASTEXITCODE -eq 0 -and $out -match '\d')
     } catch {
         return $false
@@ -1733,21 +1639,6 @@ function Update-SessionPath {
 # --- Cache para evitar reinstalar Node.js em loop na mesma sessao ---
 $script:NodeJSTentado   = $false
 $script:NodeJSResultado = $false
-
-<#
-.SYNOPSIS
-    Verifica se o processo atual esta rodando com privilegios de Administrador.
-.OUTPUTS
-    [bool] $true se elevado, $false caso contrario.
-#>
-function Test-IsAdmin {
-    try {
-        $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    } catch {
-        return $false
-    }
-}
 
 <#
 .SYNOPSIS
@@ -1847,79 +1738,42 @@ function Install-NodeJSPortable {
 
 <#
 .SYNOPSIS
-    Instala Node.js LTS. Detecta privilegio admin e escolhe estrategia automaticamente.
+    Instala Node.js LTS no perfil do usuario atual.
 .DESCRIPTION
-    Com admin: instalacao system-wide (winget --scope machine ou MSI ALLUSERS=1).
-    Sem admin: instalacao no perfil do usuario (winget --scope user ou .zip portable).
+    Tenta o pacote portable do WinGet em scope=user e usa o .zip oficial como
+    fallback. Nunca instala por maquina nem solicita elevacao UAC.
 .PARAMETER WingetOk
     Indica se winget esta disponivel na sessao atual.
 #>
 function Install-NodeJS {
     param([bool]$WingetOk)
 
-    $isAdmin = Test-IsAdmin
     $nodeInstalled = $false
+    Write-Info "Instalando Node.js no perfil do usuario, sem privilegios administrativos."
 
-    if ($isAdmin) {
-        Write-Info "Privilegio Administrador detectado. Instalando Node.js para todos os usuarios."
-
-        # 1) winget --scope machine
-        if ($WingetOk) {
-            try {
-                Write-Step "Instalando Node.js LTS via winget (scope=machine)..."
-                & winget install --id OpenJS.NodeJS.LTS --silent --scope machine `
-                    --accept-package-agreements --accept-source-agreements 2>&1 |
-                    Where-Object { $_ -notmatch '^\s*[-\\|/]\s*$' } |
-                    ForEach-Object { if ($_.Trim()) { Write-Host $_ } }
-                if ($LASTEXITCODE -eq 0) { $nodeInstalled = $true }
-            } catch {
-                Write-Warn "winget --scope machine falhou. Tentando MSI direto..."
-            }
-        }
-
-        # 2) MSI ALLUSERS=1
-        if (-not $nodeInstalled) {
-            try {
-                Write-Step "Baixando instalador do Node.js LTS..."
-                $nodeInfo    = Invoke-RestMethod "https://nodejs.org/dist/index.json"
-                $lts         = $nodeInfo | Where-Object { $_.lts } | Select-Object -First 1
-                $nodeVersion = $lts.version
-                $nodeUrl     = "https://nodejs.org/dist/$nodeVersion/node-$nodeVersion-x64.msi"
-                $nodeMsi     = "$env:TEMP\node-lts.msi"
-                $null = Invoke-FastDownload -Url $nodeUrl -OutFile $nodeMsi -Label "Node.js $nodeVersion MSI"
-                Write-Step "Instalando Node.js $nodeVersion para todos os usuarios..."
-                Start-Process msiexec.exe -ArgumentList "/i `"$nodeMsi`" /quiet /norestart ALLUSERS=1" -Wait
-                Remove-Item $nodeMsi -Force -ErrorAction SilentlyContinue
+    if ($WingetOk) {
+        try {
+            Write-Step "Instalando Node.js LTS portable via WinGet (scope=user)..."
+            & winget install --id OpenJS.NodeJS.LTS --exact --silent --scope user `
+                --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 |
+                Where-Object { $_ -notmatch '^\s*[-\\|/]\s*$' } |
+                ForEach-Object { if ($_.Trim()) { Write-Host $_ } }
+            if ($LASTEXITCODE -eq 0) {
                 $nodeInstalled = $true
-            } catch {
-                Write-Fail "Falha MSI ALLUSERS=1: $_"
+            } else {
+                Write-Warn "WinGet encerrou com o codigo $LASTEXITCODE. Usando o pacote portable oficial."
             }
-        }
-    } else {
-        Write-Info "Sem privilegio admin. Instalando Node.js no perfil do usuario (sem MSI)."
-
-        # 1) Tenta winget --scope user (depende de manifest disponivel)
-        if ($WingetOk) {
-            try {
-                Write-Step "Tentando winget (scope=user)..."
-                & winget install --id OpenJS.NodeJS.LTS --silent --scope user `
-                    --accept-package-agreements --accept-source-agreements 2>&1 |
-                    Where-Object { $_ -notmatch '^\s*[-\\|/]\s*$' } |
-                    ForEach-Object { if ($_.Trim()) { Write-Host $_ } }
-                if ($LASTEXITCODE -eq 0) { $nodeInstalled = $true }
-            } catch {
-                Write-Warn "winget --scope user falhou ou nao suporta este pacote."
-            }
-        }
-
-        # 2) Fallback: portable .zip (sempre funciona, sem admin)
-        if (-not $nodeInstalled) {
-            $nodeInstalled = Install-NodeJSPortable
+        } catch {
+            Write-Warn "WinGet nao conseguiu instalar Node.js em scope=user: $($_.Exception.Message)"
         }
     }
 
+    if (-not $nodeInstalled) {
+        $nodeInstalled = Install-NodeJSPortable
+    }
+
     if ($nodeInstalled) {
-        # Recarrega PATH completo do registro (MSI atualizou Machine, ou Set-UserEnvVar atualizou User)
+        # Recarrega PATH completo do registro (WinGet ou Set-UserEnvVar atualizou User)
         Update-SessionPath
 
         # Garante caminhos padrao - inclui user-scope (LocalAppData\nodejs) para
@@ -2138,7 +1992,10 @@ function Invoke-NpmInstallGlobal {
     }
 
     # --prefix sobrescreve config user/global; --cache ajusta cache
-    & npm install -g $Package --prefix "$npmPrefix" --cache "$npmCache" 2>&1 |
+    $npmCmd = Get-NpmCommandPath
+    if (-not $npmCmd) { return 9009 }
+
+    & $npmCmd install -g $Package --prefix "$npmPrefix" --cache "$npmCache" 2>&1 |
         ForEach-Object { Write-Host $_ }
 
     return $LASTEXITCODE
@@ -2155,9 +2012,10 @@ function Invoke-NpmTool {
 
     Write-Step "Verificando $Label..."
 
-    # Garante Node.js/npm instalado para todo o sistema
+    # Garante Node.js/npm instalado no perfil do usuario
     if (-not (Ensure-NodeJS -WingetOk $wingetOk)) {
         Write-Warn "Nao foi possivel garantir o Node.js. Pulando $Label."
+        Set-OperationFailure -Name $Label -Reason "Node.js/npm indisponivel"
         Pause-Readable 3
         return
     }
@@ -2188,7 +2046,12 @@ function Invoke-NpmTool {
             if ([string]::IsNullOrWhiteSpace($installedV)) {
                 Write-Ok "$Label detectado em: $($toolInfo.Source)"
                 Write-Warn "Versao instalada nao identificada. Verificando/atualizando via npm para garantir."
-                $null = Invoke-NpmInstallGlobal -Package $Package
+                $npmExit = Invoke-NpmInstallGlobal -Package $Package
+                if ($npmExit -ne 0) { throw "npm encerrou com o codigo $npmExit." }
+                $after = Get-CliToolInfo -Cmd $Cmd -NpmPackage $NpmName
+                if (-not $after.Installed) { throw "$Label nao foi detectado depois da atualizacao." }
+                $afterVersion = ($after.Version -replace '^[^\d]*').Trim() -split '\s+' | Select-Object -First 1
+                if ($latestVer -and $afterVersion -ne $latestVer) { throw "Versao esperada $latestVer, mas foi detectada $afterVersion." }
                 Write-Ok "$Label verificado/atualizado via npm."
                 Pause-Readable 3
                 return
@@ -2204,22 +2067,32 @@ function Invoke-NpmTool {
                 Write-Warn "Atualizacao disponivel: $installedV -> $latestVer"
                 Pause-Readable 2
                 Write-Step "Atualizando $Label via npm (prefix=$npmBinUser)..."
-                $null = Invoke-NpmInstallGlobal -Package $Package
+                $npmExit = Invoke-NpmInstallGlobal -Package $Package
+                if ($npmExit -ne 0) { throw "npm encerrou com o codigo $npmExit." }
+                $after = Get-CliToolInfo -Cmd $Cmd -NpmPackage $NpmName
+                if (-not $after.Installed) { throw "$Label nao foi detectado depois da atualizacao." }
+                $afterVersion = ($after.Version -replace '^[^\d]*').Trim() -split '\s+' | Select-Object -First 1
+                if ($latestVer -and $afterVersion -ne $latestVer) { throw "Versao esperada $latestVer, mas foi detectada $afterVersion." }
                 Write-Ok "$Label atualizado com sucesso."
                 Pause-Readable 3
             }
         } catch {
-            Write-Warn "Nao foi possivel verificar atualizacoes do ${Label}: $_"
+            Set-OperationFailure -Name $Label -Reason $_.Exception.Message
+            Write-Fail "Falha ao verificar/atualizar ${Label}: $($_.Exception.Message)"
             Pause-Readable 3
         }
     } else {
         Write-Step "$Label nao encontrado. Instalando em: $npmBinUser"
         try {
-            $null = Invoke-NpmInstallGlobal -Package $Package
+            $npmExit = Invoke-NpmInstallGlobal -Package $Package
+            if ($npmExit -ne 0) { throw "npm encerrou com o codigo $npmExit." }
+            $after = Get-CliToolInfo -Cmd $Cmd -NpmPackage $NpmName
+            if (-not $after.Installed) { throw "$Label nao foi detectado depois da instalacao." }
             Write-Ok "$Label instalado com sucesso."
             Write-Warn "Abra um novo terminal para usar o comando '$Cmd'."
             Pause-Readable 3
         } catch {
+            Set-OperationFailure -Name $Label -Reason $_.Exception.Message
             Write-Fail "Falha na instalacao do ${Label}: $_"
             Pause-Readable 3
         }
@@ -2362,9 +2235,13 @@ function Invoke-Diagnostico {
         try {
             $claudeDeskInfo = Get-ClaudeDesktopInfo -WingetOk $wingetOk
             if ($claudeDeskInfo.Installed) {
-                if ($claudeDeskInfo.Version) { $claudeDeskStatus = "v$($claudeDeskInfo.Version) - Instalado" }
-                else { $claudeDeskStatus = "Instalado ($($claudeDeskInfo.Method))" }
-                $claudeDeskColor = "Green"; $claudeDeskAcao = "ok"
+                if ($wingetOk -and (Test-WingetUpgradeAvailable -Id 'Anthropic.Claude')) {
+                    $claudeDeskStatus = "Atualizacao disponivel"; $claudeDeskColor = "Yellow"; $claudeDeskAcao = "atualizar"
+                } else {
+                    if ($claudeDeskInfo.Version) { $claudeDeskStatus = "v$($claudeDeskInfo.Version) - Instalado" }
+                    else { $claudeDeskStatus = "Instalado ($($claudeDeskInfo.Method))" }
+                    $claudeDeskColor = "Green"; $claudeDeskAcao = "ok"
+                }
             }
         } catch {}
         $diagItens += [PSCustomObject]@{ Nome = "Claude Desktop"; Status = $claudeDeskStatus; Cor = $claudeDeskColor; Acao = $claudeDeskAcao }
@@ -2375,12 +2252,16 @@ function Invoke-Diagnostico {
         try {
             $codexDeskInfo = Get-CodexDesktopInfo -WingetOk $wingetOk
             if ($codexDeskInfo.Installed) {
-                if ($codexDeskInfo.Version) {
-                    $codexDeskStatus = "v$($codexDeskInfo.Version) - Instalado"
+                if ($wingetOk -and (Test-WingetUpgradeAvailable -Id '9PLM9XGG6VKS' -Source 'msstore')) {
+                    $codexDeskStatus = "Atualizacao disponivel"; $codexDeskColor = "Yellow"; $codexDeskAcao = "atualizar"
                 } else {
-                    $codexDeskStatus = "Instalado ($($codexDeskInfo.Method))"
+                    if ($codexDeskInfo.Version) {
+                        $codexDeskStatus = "v$($codexDeskInfo.Version) - Instalado"
+                    } else {
+                        $codexDeskStatus = "Instalado ($($codexDeskInfo.Method))"
+                    }
+                    $codexDeskColor = "Green"; $codexDeskAcao = "ok"
                 }
-                $codexDeskColor = "Green"; $codexDeskAcao = "ok"
             }
         } catch {}
         $diagItens += [PSCustomObject]@{ Nome = "Codex Desktop "; Status = $codexDeskStatus; Cor = $codexDeskColor; Acao = $codexDeskAcao }
@@ -2391,9 +2272,13 @@ function Invoke-Diagnostico {
         try {
             $openDeskInfo = Get-OpenCodeDesktopInfo -WingetOk $wingetOk
             if ($openDeskInfo.Installed) {
-                if ($openDeskInfo.Version) { $openDeskStatus = "v$($openDeskInfo.Version) - Instalado" }
-                else { $openDeskStatus = "Instalado ($($openDeskInfo.Method))" }
-                $openDeskColor = "Green"; $openDeskAcao = "ok"
+                if ($wingetOk -and (Test-WingetUpgradeAvailable -Id 'SST.OpenCodeDesktop')) {
+                    $openDeskStatus = "Atualizacao disponivel"; $openDeskColor = "Yellow"; $openDeskAcao = "atualizar"
+                } else {
+                    if ($openDeskInfo.Version) { $openDeskStatus = "v$($openDeskInfo.Version) - Instalado" }
+                    else { $openDeskStatus = "Instalado ($($openDeskInfo.Method))" }
+                    $openDeskColor = "Green"; $openDeskAcao = "ok"
+                }
             }
         } catch {}
         $diagItens += [PSCustomObject]@{ Nome = "OpenCode Desk "; Status = $openDeskStatus; Cor = $openDeskColor; Acao = $openDeskAcao }
@@ -2479,6 +2364,31 @@ function Invoke-Diagnostico {
 # LOOP PRINCIPAL - menu principal: Instalar ou Remover
 # Em modo nao-interativo (param block) executa apenas uma vez como Instalar
 # ----------------------------------------------------------
+$usuarioDaSessao = Get-UsuarioInterativo
+if ($usuarioDaSessao.ElevadoComOutroUsr) {
+    Write-Fail "O script foi elevado como '$env:USERNAME', mas a sessao pertence a '$($usuarioDaSessao.Username)'."
+    Write-Warn "Feche esta janela e execute o script normalmente, sem 'Executar como administrador'."
+    Write-Warn "Instaladores por usuario nao podem ser registrados corretamente por outra conta administrativa."
+    if ($script:TranscriptStarted) {
+        try { Stop-Transcript | Out-Null } catch { }
+    }
+    return
+}
+
+function Invoke-NpmUninstallGlobal {
+    param([Parameter(Mandatory=$true)][string]$Package)
+
+    $u = Get-UsuarioInterativo
+    $npmCmd = Get-NpmCommandPath
+    if (-not $npmCmd) { return 9009 }
+
+    $npmPrefix = Join-Path $u.AppData "npm"
+    $npmCache = Join-Path $u.AppData "npm-cache"
+    & $npmCmd uninstall -g $Package --prefix "$npmPrefix" --cache "$npmCache" 2>&1 |
+        ForEach-Object { Write-Host $_ }
+    return $LASTEXITCODE
+}
+
 do {
 
 if ($Tudo -or $CLI -or $Desktop -or $Pacotes) {
@@ -2629,12 +2539,19 @@ if ($modoPrincipal -eq '2') {
 
     try {
         $wingetOk = $false
-        try { $null = & winget --version 2>&1; $wingetOk = $true } catch { }
+        try {
+            $null = & winget --version 2>&1
+            $wingetOk = ($LASTEXITCODE -eq 0)
+        } catch { }
 
         # Garante npm no PATH para remocao CLI
-        $npmPaths = @("$env:ProgramFiles
-odejs", "$env:APPDATA
-pm")
+        $uRemocao = Get-UsuarioInterativo
+        $npmPaths = @(
+            "$env:ProgramFiles\nodejs",
+            (Join-Path $uRemocao.LocalAppData "nodejs"),
+            (Join-Path $uRemocao.AppData "npm"),
+            (Join-Path $uRemocao.LocalAppData "Microsoft\WinGet\Links")
+        )
         foreach ($p in $npmPaths) {
             if ((Test-Path -LiteralPath $p -ErrorAction SilentlyContinue) -and ($env:Path -notlike "*$p*")) {
                 $env:Path = "$p;$env:Path"
@@ -2647,13 +2564,13 @@ pm")
             # Metodo 1: winget
             if ($wingetOk) {
                 try {
-                    $out = & winget uninstall --id Anthropic.ClaudeCode --silent --accept-source-agreements 2>&1 | Out-String
+                    $out = & winget uninstall --id Anthropic.ClaudeCode --exact --silent --scope user --accept-source-agreements --disable-interactivity 2>&1 | Out-String
                     Write-Host $out
                 } catch { }
             }
 
             # Metodo 2: npm uninstall
-            try { & npm uninstall -g @anthropic-ai/claude-code 2>&1 | ForEach-Object { Write-Host $_ } } catch { }
+            try { $null = Invoke-NpmUninstallGlobal -Package '@anthropic-ai/claude-code' } catch { }
 
             # Metodo 3: busca ampla por executavel claude em todos os locais conhecidos
             $claudeLocais = @(
@@ -2667,7 +2584,6 @@ pm")
                 "$env:APPDATA\npm\node_modules\@anthropic-ai\claude-code",
                 "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe",
                 "$env:LOCALAPPDATA\Microsoft\WinGet\Links\claude.exe",
-                "$env:ProgramFiles\Anthropic\Claude Code",
                 "$env:USERPROFILE\.claude\local"
             )
             foreach ($p in $claudeLocais) {
@@ -2702,11 +2618,8 @@ pm")
                     [Environment]::SetEnvironmentVariable($var, $null, "User")
                     Write-Ok "Variavel removida: $var"
                 }
-                $valM = [Environment]::GetEnvironmentVariable($var, "Machine")
-                if ($valM) {
-                    [Environment]::SetEnvironmentVariable($var, $null, "Machine")
-                    Write-Ok "Variavel de sistema removida: $var"
-                }
+                # Configuracoes de maquina pertencem ao administrador e nao sao
+                # alteradas no fluxo de usuario comum.
             }
 
             # Remove entradas do PATH que apontam para o Claude
@@ -2714,9 +2627,7 @@ pm")
             $pathUser = [Environment]::GetEnvironmentVariable("Path", "User")
             $pathEntradas = $pathUser -split ";"
             $pathLimpo = ($pathEntradas | Where-Object {
-                $_ -notmatch "claude" -and
-                $_ -ne "$env:USERPROFILE\.local\bin" -or
-                (Test-Path -LiteralPath $_ -ErrorAction SilentlyContinue)
+                -not [string]::IsNullOrWhiteSpace($_) -and $_ -notmatch '(?i)claude'
             }) -join ";"
             if ($pathLimpo -ne $pathUser) {
                 [Environment]::SetEnvironmentVariable("Path", $pathLimpo, "User")
@@ -2724,8 +2635,7 @@ pm")
             }
 
             # Verifica resultado
-            $claudeAinda = $false
-            try { $null = & claude --version 2>&1; $claudeAinda = $true } catch { }
+            $claudeAinda = (Get-CliToolInfo -Cmd 'claude' -NpmPackage '@anthropic-ai/claude-code').Installed
             if (-not $claudeAinda) {
                 Write-Ok "Claude Code removido com sucesso."
             } else {
@@ -2736,7 +2646,7 @@ pm")
         if ($remCodexCLI) {
             Write-Step "Removendo Codex CLI..."
 
-            try { & npm uninstall -g @openai/codex 2>&1 | ForEach-Object { Write-Host $_ } } catch { }
+            try { $null = Invoke-NpmUninstallGlobal -Package '@openai/codex' } catch { }
 
             $codexLocais = @(
                 "$env:APPDATA\npm\codex.exe",
@@ -2761,8 +2671,7 @@ pm")
                 }
             }
 
-            $codexAinda = $false
-            try { $null = & codex --version 2>&1; $codexAinda = $true } catch { }
+            $codexAinda = (Get-CliToolInfo -Cmd 'codex' -NpmPackage '@openai/codex').Installed
             if (-not $codexAinda) {
                 Write-Ok "Codex CLI removido com sucesso."
             } else {
@@ -2773,7 +2682,7 @@ pm")
         if ($remOpenCode) {
             Write-Step "Removendo OpenCode..."
 
-            try { & npm uninstall -g opencode-ai 2>&1 | ForEach-Object { Write-Host $_ } } catch { }
+            try { $null = Invoke-NpmUninstallGlobal -Package 'opencode-ai' } catch { }
 
             $openLocais = @(
                 "$env:APPDATA\npm\opencode.exe",
@@ -2790,8 +2699,7 @@ pm")
                 }
             }
 
-            $openAinda = $false
-            try { $null = & opencode --version 2>&1; $openAinda = $true } catch { }
+            $openAinda = (Get-CliToolInfo -Cmd 'opencode' -NpmPackage 'opencode-ai').Installed
             if (-not $openAinda) {
                 Write-Ok "OpenCode removido com sucesso."
             } else {
@@ -2807,21 +2715,34 @@ pm")
             $updateExe = "$env:LOCALAPPDATA\AnthropicClaude\Update.exe"
             if (Test-Path -LiteralPath $updateExe -ErrorAction SilentlyContinue) {
                 try {
-                    Start-Process $updateExe -ArgumentList "--uninstall" -Wait -NoNewWindow
-                    $removido = $true
+                    $proc = Start-Process $updateExe -ArgumentList "--uninstall" -Wait -NoNewWindow -PassThru -ErrorAction Stop
+                    $removido = ($proc.ExitCode -eq 0)
                 } catch { }
             }
 
             # Metodo 2: winget
             if (-not $removido -and $wingetOk) {
                 try {
-                    $out = & winget uninstall --id Anthropic.Claude --silent --accept-source-agreements 2>&1 | Out-String
+                    $out = & winget uninstall --id Anthropic.Claude --exact --silent --scope user --accept-source-agreements --disable-interactivity 2>&1 | Out-String
                     Write-Host $out
-                    if ($out -notmatch "nao encontrado|not found|No installed") { $removido = $true }
+                    if ($LASTEXITCODE -eq 0) { $removido = $true }
                 } catch { }
             }
 
-            # Metodo 3: remover pasta diretamente
+            # Metodo 3: pacote MSIX registrado para o usuario atual
+            if (-not $removido) {
+                try {
+                    $pkg = Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object {
+                        $_.Name -match '(?i)(Claude|Anthropic)' -or $_.PackageFamilyName -match '(?i)(Claude|Anthropic)'
+                    } | Select-Object -First 1
+                    if ($pkg) {
+                        Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop
+                        $removido = $true
+                    }
+                } catch { }
+            }
+
+            # Metodo 4: remover pasta diretamente
             $claudeDeskPath = "$env:LOCALAPPDATA\AnthropicClaude"
             if (Test-Path -LiteralPath $claudeDeskPath -ErrorAction SilentlyContinue) {
                 try { Remove-Item -LiteralPath $claudeDeskPath -Recurse -Force -ErrorAction SilentlyContinue; $removido = $true } catch { }
@@ -2841,8 +2762,9 @@ pm")
                 # Tenta pelo ID da Store e pelo nome
                 foreach ($id in @('9PLM9XGG6VKS', 'OpenAI.Codex')) {
                     try {
-                        $out = & winget uninstall --id $id --silent --accept-source-agreements 2>&1 | Out-String
-                        if ($out -notmatch "nao encontrado|not found|No installed") {
+                        $sourceArgs = if ($id -eq '9PLM9XGG6VKS') { @('--source','msstore') } else { @() }
+                        $out = & winget uninstall --id $id @sourceArgs --silent --accept-source-agreements --disable-interactivity 2>&1 | Out-String
+                        if ($LASTEXITCODE -eq 0) {
                             $removido = $true; break
                         }
                     } catch { }
@@ -2850,7 +2772,9 @@ pm")
             }
             if (-not $removido) {
                 try {
-                    $pkg = Get-AppxPackage -Name "*Codex*" -ErrorAction SilentlyContinue
+                    $pkg = Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object {
+                        $_.Name -match '(?i)(ChatGPT|Codex|OpenAI)' -or $_.PackageFamilyName -match '(?i)(ChatGPT|Codex|OpenAI)'
+                    } | Select-Object -First 1
                     if ($pkg) {
                         Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue
                         $removido = $true
@@ -2869,8 +2793,8 @@ pm")
             $removido = $false
             if ($wingetOk) {
                 try {
-                    $out = & winget uninstall --id SST.OpenCodeDesktop --silent --accept-source-agreements 2>&1 | Out-String
-                    if ($out -notmatch "nao encontrado|not found|No installed") { $removido = $true }
+                    $out = & winget uninstall --id SST.OpenCodeDesktop --exact --silent --scope user --accept-source-agreements --disable-interactivity 2>&1 | Out-String
+                    if ($LASTEXITCODE -eq 0) { $removido = $true }
                 } catch { }
             }
             if (-not $removido) {
@@ -3016,8 +2940,9 @@ $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
 # Garante que npm instala no perfil do usuario logado
 # (em TS/UAC, APPDATA do usuario real, nao do admin elevado)
 # ----------------------------------------------------------
-$npmGlobalDir = "$($usuarioReal.AppData)\npm"
-try {
+if ($instalarCodexCLI -or $instalarOpenCode) {
+    $npmGlobalDir = "$($usuarioReal.AppData)\npm"
+    try {
     # Cria o diretorio no perfil do usuario real (admin tem permissao)
     if (-not (Test-Path -LiteralPath $npmGlobalDir -ErrorAction SilentlyContinue)) {
         New-Item -ItemType Directory -Path $npmGlobalDir -Force -ErrorAction SilentlyContinue | Out-Null
@@ -3048,11 +2973,14 @@ try {
 } catch { }
 
 # ----------------------------------------------------------
-# Detecta tipo de sistema operacional
-# ProductType: 1 = Workstation, 2 = Domain Controller, 3 = Server
+# Detecta disponibilidade do WinGet na sessao do usuario
 # ----------------------------------------------------------
 $wingetOk = $false
-try { $null = & winget --version 2>&1; $wingetOk = $true } catch { }
+try {
+    $null = & winget --version 2>&1
+    $wingetOk = ($LASTEXITCODE -eq 0)
+    } catch { }
+}
 
 if ($wingetOk) {
     Write-Ok "winget disponivel. Usando instalacao silenciosa."
@@ -3063,15 +2991,28 @@ if ($wingetOk) {
 # ----------------------------------------------------------
 # DIAGNOSTICO - chama funcao e filtra apenas o que precisa de acao
 # ----------------------------------------------------------
-$codexSelecionado = $instalarCodexCLI -or $instalarCodexDesk
-$diagResultado = Invoke-Diagnostico `
-    -CheckGit        $instalarGit `
-    -CheckClaudeCLI  $instalarClaudeCLI `
-    -CheckCodexCLI   $instalarCodexCLI `
-    -CheckOpenCode   $instalarOpenCode `
-    -CheckClaudeDesk $instalarClaudeDesk `
-    -CheckCodexDesk  $instalarCodexDesk `
-    -CheckOpenDesk   $instalarOpenDesk
+if ($SkipDiagnostico) {
+    Write-Warn "Diagnostico inicial ignorado por -SkipDiagnostico. A selecao original sera processada."
+    $diagResultado = [PSCustomObject]@{
+        Prosseguir = $true
+        Git        = $instalarGit
+        ClaudeCLI  = $instalarClaudeCLI
+        CodexCLI   = $instalarCodexCLI
+        OpenCode   = $instalarOpenCode
+        ClaudeDesk = $instalarClaudeDesk
+        CodexDesk  = $instalarCodexDesk
+        OpenDesk   = $instalarOpenDesk
+    }
+} else {
+    $diagResultado = Invoke-Diagnostico `
+        -CheckGit        $instalarGit `
+        -CheckClaudeCLI  $instalarClaudeCLI `
+        -CheckCodexCLI   $instalarCodexCLI `
+        -CheckOpenCode   $instalarOpenCode `
+        -CheckClaudeDesk $instalarClaudeDesk `
+        -CheckCodexDesk  $instalarCodexDesk `
+        -CheckOpenDesk   $instalarOpenDesk
+}
 
 if (-not $diagResultado.Prosseguir) {
     Write-Host ""
@@ -3087,7 +3028,6 @@ if ($instalarOpenCode)   { $instalarOpenCode   = $diagResultado.OpenCode }
 if ($instalarClaudeDesk) { $instalarClaudeDesk = $diagResultado.ClaudeDesk }
 if ($instalarCodexDesk)  { $instalarCodexDesk  = $diagResultado.CodexDesk }
 if ($instalarOpenDesk)   { $instalarOpenDesk   = $diagResultado.OpenDesk }
-$instalarVcRedist = $codexSelecionado
 
 # ============================================================
 # DASHBOARD: inicia banner e contador de fases
@@ -3097,7 +3037,6 @@ if ($instalarGit)        { $fasesAtivas++ }
 if ($instalarClaudeDesk) { $fasesAtivas++ }
 if ($instalarClaudeCLI)  { $fasesAtivas++ }
 if ($instalarCodexDesk)  { $fasesAtivas++ }
-if ($instalarVcRedist)   { $fasesAtivas++ }
 if ($instalarOpenDesk)   { $fasesAtivas++ }
 if ($instalarCodexCLI)   { $fasesAtivas++ }
 if ($instalarOpenCode)   { $fasesAtivas++ }
@@ -3228,7 +3167,8 @@ if ($instalarGit) {
                 "/COMPONENTS=icons,ext\reg\shellhere,assoc,assoc_sh",
                 "/DIR=`"$gitBashPathCorreto`""
             )
-            Start-Process -FilePath $gitInstaller -ArgumentList $installArgs -Wait -NoNewWindow
+            $gitProc = Start-Process -FilePath $gitInstaller -ArgumentList $installArgs -Wait -NoNewWindow -PassThru -ErrorAction Stop
+            if ($gitProc.ExitCode -ne 0) { throw "O instalador do Git encerrou com o codigo $($gitProc.ExitCode)." }
             if (Test-Path -LiteralPath "$gitBashPathCorreto\cmd\git.exe") {
                 $gitBashPath    = $gitBashPathCorreto
                 $gitCmdExe      = "$gitBashPathCorreto\cmd\git.exe"
@@ -3239,6 +3179,7 @@ if ($instalarGit) {
                 Write-Warn "Reinstalacao nao produziu Git em $gitBashPathCorreto; mantendo instalacao anterior."
             }
         } catch {
+            Set-OperationFailure -Name 'Git Bash' -Reason $_.Exception.Message
             Write-Fail "Erro ao reinstalar Git Bash no local correto: $_"
         } finally {
             if (Test-Path $gitInstaller) { Remove-Item $gitInstaller -Force }
@@ -3266,21 +3207,31 @@ if ($instalarGit) {
                     $gitInstaller = "$env:TEMP\git-installer.exe"
                     try {
                         $null = Invoke-FastDownload -Url $asset.browser_download_url -OutFile $gitInstaller -Label "Git Bash $latestVer"
-                        # Se o Git esta em user-scope, atualiza com /CURRENTUSER
-                        $extraArgs = @()
-                        if ($gitBashPath -like "$($uGit.LocalAppData)\*" -or $gitBashPath -like "$env:LOCALAPPDATA\*") {
-                            $extraArgs += "/CURRENTUSER"
-                        }
+                        # Mesmo que exista uma copia de maquina, a atualizacao e
+                        # instalada no perfil atual para nunca solicitar UAC.
+                        $gitBashPathAlvo = "$($uGit.LocalAppData)\Programs\Git"
                         $installArgs = @(
                             "/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-",
+                            "/CURRENTUSER",
                             "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS",
                             "/COMPONENTS=icons,ext\reg\shellhere,assoc,assoc_sh",
-                            "/DIR=`"$gitBashPath`""
-                        ) + $extraArgs
-                        Start-Process -FilePath $gitInstaller -ArgumentList $installArgs -Wait -NoNewWindow
-                        Write-Ok "Git Bash atualizado para $latestVer com sucesso."
+                            "/DIR=`"$gitBashPathAlvo`""
+                        )
+                        $gitProc = Start-Process -FilePath $gitInstaller -ArgumentList $installArgs -Wait -NoNewWindow -PassThru -ErrorAction Stop
+                        $gitCmdAlvo = "$gitBashPathAlvo\cmd\git.exe"
+                        if ($gitProc.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $gitCmdAlvo)) {
+                            throw "O instalador encerrou com codigo $($gitProc.ExitCode) e o Git nao foi confirmado no destino."
+                        }
+                        $versaoConfirmada = ((& $gitCmdAlvo --version 2>&1) -replace '^git version ' -replace '\.windows\.\d+$').Trim()
+                        if ($versaoConfirmada -ne $latestVer) {
+                            throw "Versao esperada $latestVer, mas foi detectada $versaoConfirmada."
+                        }
+                        $gitBashPath = $gitBashPathAlvo
+                        $gitCmdExe = $gitCmdAlvo
+                        Write-Ok "Git Bash atualizado para $latestVer em escopo de usuario."
                         Pause-Readable 3
                     } catch {
+                        Set-OperationFailure -Name 'Git Bash' -Reason $_.Exception.Message
                         Write-Fail "Erro ao atualizar Git Bash: $_"
                         Pause-Readable 3
                     } finally {
@@ -3320,7 +3271,8 @@ if ($instalarGit) {
                     "/COMPONENTS=icons,ext\reg\shellhere,assoc,assoc_sh",
                     "/DIR=`"$gitBashPath`""
                 )
-                Start-Process -FilePath $gitInstaller -ArgumentList $installArgs -Wait -NoNewWindow
+                $gitProc = Start-Process -FilePath $gitInstaller -ArgumentList $installArgs -Wait -NoNewWindow -PassThru -ErrorAction Stop
+                if ($gitProc.ExitCode -ne 0) { throw "O instalador do Git encerrou com o codigo $($gitProc.ExitCode)." }
                 if (Test-Path $gitCmdExe) {
                     Write-Ok "Git Bash instalado com sucesso em: $gitBashPath"
                     Pause-Readable 3
@@ -3329,6 +3281,7 @@ if ($instalarGit) {
                     Pause-Readable 3
                 }
             } catch {
+                Set-OperationFailure -Name 'Git Bash' -Reason $_.Exception.Message
                 Write-Fail "Erro ao instalar Git Bash: $_"
                 Pause-Readable 3
             } finally {
@@ -3430,6 +3383,7 @@ function Install-ClaudeDesktopMsix {
         Write-Ok "Pesquise por 'Claude' no Menu Iniciar para abrir o app."
         return $true
     } catch {
+        Set-OperationFailure -Name 'Claude Desktop' -Reason $_.Exception.Message
         Write-Fail "Falha ao instalar o Claude Desktop pelo MSIX oficial: $_"
         Write-Warn "Baixe manualmente em: https://claude.com/download"
         return $false
@@ -3437,6 +3391,55 @@ function Install-ClaudeDesktopMsix {
         if (-not $keepPackage -and (Test-Path -LiteralPath $packagePath -ErrorAction SilentlyContinue)) {
             Remove-Item -LiteralPath $packagePath -Force -ErrorAction SilentlyContinue
         }
+    }
+}
+
+function Install-ClaudeCodeNative {
+    $u = Get-UsuarioInterativo
+    if ($u.ElevadoComOutroUsr) {
+        Write-Fail "Claude Code deve ser instalado na sessao do proprio usuario."
+        return $false
+    }
+
+    $installerPath = Join-Path $env:TEMP "claude-code-install.ps1"
+    try {
+        Write-Step "Baixando o instalador nativo atual do Claude Code..."
+        $ok = Invoke-FastDownload -Url "https://claude.ai/install.ps1" -OutFile $installerPath -Label "Claude Code"
+        if (-not $ok -or -not (Test-Path -LiteralPath $installerPath)) {
+            throw "O instalador oficial nao foi baixado."
+        }
+
+        $installerText = Get-Content -LiteralPath $installerPath -Raw -ErrorAction Stop
+        if ($installerText -match '(?i)<html' -or $installerText -notmatch '(?i)claude') {
+            throw "A resposta recebida nao parece ser o instalador PowerShell do Claude Code."
+        }
+
+        $windowsPowerShell = Get-Command powershell.exe -ErrorAction Stop
+        Write-Step "Executando o instalador nativo no perfil '$($u.Username)'..."
+        $proc = Start-Process -FilePath $windowsPowerShell.Source `
+            -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$installerPath`"") `
+            -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        if ($proc.ExitCode -ne 0) {
+            throw "O instalador encerrou com o codigo $($proc.ExitCode)."
+        }
+
+        $claudeBin = Join-Path $u.UserProfile ".local\bin"
+        $null = Set-UserEnvVar -Name "Path" -Value $claudeBin -Append
+        if ($env:Path -notlike "*$claudeBin*") { $env:Path = "$claudeBin;$env:Path" }
+
+        $installed = Get-CliToolInfo -Cmd "claude" -NpmPackage "@anthropic-ai/claude-code"
+        if (-not $installed.Installed) {
+            throw "A instalacao terminou, mas o comando claude nao foi detectado."
+        }
+
+        Write-Ok "Claude Code instalado/atualizado em escopo de usuario."
+        return $true
+    } catch {
+        Set-OperationFailure -Name 'Claude Code' -Reason $_.Exception.Message
+        Write-Fail "Falha no instalador nativo do Claude Code: $($_.Exception.Message)"
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -3455,23 +3458,23 @@ if ($instalarClaudeDesk) {
         if ($wingetOk) {
             Write-Step "Verificando atualizacoes..."
             try {
-                & winget upgrade --id Anthropic.Claude --silent --accept-package-agreements --accept-source-agreements 2>&1 |
+                & winget upgrade --id Anthropic.Claude --exact --silent --scope user --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 |
                     Where-Object { $_ -notmatch '^\s*[-\\|/]\s*$' } |
                     ForEach-Object { if ($_.Trim()) { Write-Host $_ } }
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Ok "Verificacao do Claude Desktop concluida."
-                } else {
-                    Write-Warn "O WinGet terminou a verificacao com o codigo $LASTEXITCODE."
-                }
+                if ($LASTEXITCODE -ne 0) { throw "WinGet encerrou com o codigo $LASTEXITCODE." }
+                if (Test-WingetUpgradeAvailable -Id 'Anthropic.Claude') { throw "A atualizacao continua pendente depois da execucao do WinGet." }
+                Write-Ok "Atualizacao do Claude Desktop concluida."
             } catch {
-                Write-Warn "Nao foi possivel verificar atualizacoes: $_"
+                Write-Warn "WinGet nao conseguiu atualizar o Claude Desktop: $_"
+                Write-Step "Tentando o pacote MSIX oficial mais recente..."
+                $null = Install-ClaudeDesktopMsix
             }
         }
         Pause-Readable 3
     } elseif ($wingetOk) {
         Write-Step "Instalando Claude Desktop via winget (silencioso)..."
         try {
-            & winget install --id Anthropic.Claude --exact --silent --accept-package-agreements --accept-source-agreements 2>&1 |
+            & winget install --id Anthropic.Claude --exact --silent --scope user --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 |
                 Where-Object { $_ -notmatch '^\s*[-\\|/]\s*$' } |
                 ForEach-Object { if ($_.Trim()) { Write-Host $_ } }
             if ($LASTEXITCODE -ne 0) {
@@ -3509,135 +3512,39 @@ if ($instalarClaudeDesk) {
 # ============================================================
 if ($instalarClaudeCLI) {
     Write-Phase "Claude Code CLI"
-
     Write-Step "Verificando Claude Code (CLI)..."
-
     $claudeInfo = Get-CliToolInfo -Cmd "claude" -NpmPackage "@anthropic-ai/claude-code"
-    $claudeInstalled = [bool]$claudeInfo.Installed
-    $claudeVersionAtual = $claudeInfo.Version
-    # Detecta se e servidor Windows (ProductType 2=DC, 3=Server) ou maquina local (1=Workstation)
-    # Preferencia por CIM (mais rapido e confiavel que WMI em servidores hardened)
-    $eServidor = $false
-    try {
-        $productType = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).ProductType
-        if ($productType -eq 2 -or $productType -eq 3) { $eServidor = $true }
-    } catch {
-        try {
-            $productType = (Get-WmiObject -Class Win32_OperatingSystem -ErrorAction Stop).ProductType
-            if ($productType -eq 2 -or $productType -eq 3) { $eServidor = $true }
-        } catch {
-            # Fallback: checa pelo nome do SO no registro
-            try {
-                $osName = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop).ProductName
-                if ($osName -match "Server") { $eServidor = $true }
-            } catch { $eServidor = $false }
-        }
-    }
-
-    if ($eServidor) {
-        Write-Warn "Ambiente de servidor detectado. O instalador oficial pode falhar (Bun requer AVX)."
-        Write-Ok "Usando npm como metodo de instalacao alternativo."
-    }
-
-    if ($claudeInstalled) {
-        Write-Ok "Claude Code ja esta instalado. Versao: $claudeVersionAtual"
+    if ($claudeInfo.Installed) {
+        Write-Ok "Claude Code ja esta instalado. Versao: $($claudeInfo.Version)"
         Write-Step "Verificando atualizacoes..."
         try {
             $npmInfo      = Invoke-RestMethod "https://registry.npmjs.org/@anthropic-ai/claude-code/latest"
             $latestVer    = $npmInfo.version
-            $installedVer = ($claudeVersionAtual -replace '^[^\d]*').Trim() -split '\s+' | Select-Object -First 1
+            $installedVer = ($claudeInfo.Version -replace '^[^\d]*').Trim() -split '\s+' | Select-Object -First 1
             if ([string]::IsNullOrWhiteSpace($installedVer)) {
                 Write-Ok "Claude Code detectado em: $($claudeInfo.Source)"
-                Write-Warn "Versao instalada nao identificada. Verificando/atualizando via npm para garantir."
-                if (-not (Ensure-NodeJS -WingetOk $wingetOk)) {
-                    Write-Fail "Node.js nao disponivel. Nao foi possivel verificar/atualizar."
-                } else {
-                    $null = Invoke-NpmInstallGlobal -Package "@anthropic-ai/claude-code"
-                    Write-Ok "Claude Code verificado/atualizado via npm."
-                }
-                Pause-Readable 3
-                return
-            }
-            Write-Ok "Versao instalada   : $installedVer"
-            Write-Ok "Versao mais recente: $latestVer"
-            if ($installedVer -eq $latestVer) {
+                Write-Warn "Versao instalada nao identificada. Reaplicando o instalador nativo atual."
+                $null = Install-ClaudeCodeNative
+            } elseif ($installedVer -eq $latestVer) {
+                Write-Ok "Versao instalada   : $installedVer"
+                Write-Ok "Versao mais recente: $latestVer"
                 Write-Ok "Claude Code esta atualizado. Nenhuma acao necessaria."
             } else {
+                Write-Ok "Versao instalada   : $installedVer"
+                Write-Ok "Versao mais recente: $latestVer"
                 Write-Warn "Atualizacao disponivel: $installedVer -> $latestVer"
-                Write-Step "Atualizando Claude Code..."
-                if ($eServidor) {
-                    if (-not (Ensure-NodeJS -WingetOk $wingetOk)) {
-                        Write-Fail "Node.js nao disponivel. Nao foi possivel atualizar."
-                    } else {
-                        $null = Invoke-NpmInstallGlobal -Package "@anthropic-ai/claude-code"
-                        Write-Ok "Claude Code atualizado com sucesso."
-                    }
-                } else {
-                    Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression
-                    Write-Ok "Claude Code atualizado com sucesso."
-                }
+                $null = Install-ClaudeCodeNative
             }
         } catch {
             Write-Warn "Nao foi possivel verificar atualizacoes: $_"
+            Write-Step "Tentando o instalador nativo atual mesmo assim..."
+            $null = Install-ClaudeCodeNative
         }
     } else {
-        Write-Step "Claude Code nao encontrado. Instalando..."
-
-        $claudeOk = $false
-
-        if ($eServidor) {
-            # Servidor: instala direto via npm (evita crash do Bun sem AVX)
-            if (-not (Ensure-NodeJS -WingetOk $wingetOk)) {
-                Write-Fail "Node.js nao disponivel. Nao e possivel instalar o Claude Code."
-                Pause-Readable 3
-            } else {
-                $u = Get-UsuarioInterativo
-                Write-Step "Instalando Claude Code via npm (prefix=$($u.AppData)\npm)..."
-                try {
-                    $null = Invoke-NpmInstallGlobal -Package "@anthropic-ai/claude-code"
-                    # Adiciona bin ao PATH da sessao para validar
-                    $npmBin = "$($u.AppData)\npm"
-                    if ((Test-Path -LiteralPath $npmBin) -and ($env:Path -notlike "*$npmBin*")) {
-                        $env:Path = "$npmBin;$env:Path"
-                    }
-                    $claudeCheck = Get-CliToolInfo -Cmd "claude" -NpmPackage "@anthropic-ai/claude-code"
-                    if ($claudeCheck.Installed) { $claudeOk = $true }
-                    if ($claudeOk) {
-                        Write-Ok "Claude Code instalado com sucesso via npm."
-                    } else {
-                        Write-Warn "Claude Code instalado. Feche e reabra o terminal para usar."
-                    }
-                } catch {
-                    Write-Fail "Falha na instalacao do Claude Code: $_"
-                }
-            }
-        } else {
-            # Maquina local: usa instalador oficial normalmente
-            try {
-                Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression
-                $claudeCheck = Get-CliToolInfo -Cmd "claude" -NpmPackage "@anthropic-ai/claude-code"
-                if ($claudeCheck.Installed) { $claudeOk = $true }
-                if ($claudeOk) {
-                    Write-Ok "Claude Code instalado com sucesso."
-                } else {
-                    Write-Warn "Claude Code instalado. Feche e reabra o terminal para usar."
-                }
-            } catch {
-                Write-Fail "Falha na instalacao do Claude Code: $_"
-            }
-        }
+        Write-Step "Claude Code nao encontrado. Instalando pelo metodo nativo oficial..."
+        $null = Install-ClaudeCodeNative
     }
     Pause-Readable 3
-}
-
-# ============================================================
-# 4. PRE-REQUISITO CODEX: VISUAL C++ REDISTRIBUTABLE X64
-# ============================================================
-if ($instalarVcRedist) {
-    $vcRedistOk = Ensure-VcRedistX64
-    if (-not $vcRedistOk) {
-        Write-Warn "Codex pode nao funcionar corretamente sem o Visual C++ Redistributable x64."
-    }
 }
 
 # ============================================================
@@ -3664,11 +3571,14 @@ if ($instalarCodexDesk) {
         if ($wingetOk) {
             Write-Step "Verificando atualizacoes..."
             try {
-                & winget upgrade --id 9PLM9XGG6VKS --silent --accept-package-agreements --accept-source-agreements 2>&1 |
+                & winget upgrade --id 9PLM9XGG6VKS --source msstore --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 |
                     Where-Object { $_ -notmatch '^\s*[-\\|/]\s*$' } |
                     ForEach-Object { if ($_.Trim()) { Write-Host $_ } }
-                Write-Ok "Verificacao do Codex Desktop concluida."
+                if ($LASTEXITCODE -ne 0) { throw "WinGet encerrou com o codigo $LASTEXITCODE." }
+                if (Test-WingetUpgradeAvailable -Id '9PLM9XGG6VKS' -Source 'msstore') { throw "A atualizacao continua pendente depois da execucao do WinGet." }
+                Write-Ok "Verificacao do ChatGPT/Codex Desktop concluida."
             } catch {
+                Set-OperationFailure -Name 'Codex Desktop' -Reason $_.Exception.Message
                 Write-Warn "Nao foi possivel verificar atualizacoes: $_"
             }
         }
@@ -3676,14 +3586,18 @@ if ($instalarCodexDesk) {
     } elseif ($wingetOk) {
         Write-Step "Codex Desktop nao encontrado. Instalando via winget (silencioso)..."
         try {
-            & winget install --id 9PLM9XGG6VKS --silent --accept-package-agreements --accept-source-agreements 2>&1 |
+            & winget install --id 9PLM9XGG6VKS --source msstore --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 |
                 Where-Object { $_ -notmatch '^\s*[-\\|/]\s*$' } |
                 ForEach-Object { if ($_.Trim()) { Write-Host $_ } }
+            if ($LASTEXITCODE -ne 0) { throw "WinGet encerrou com o codigo $LASTEXITCODE." }
+            $codexDepois = Get-CodexDesktopInfo -WingetOk $true
+            if (-not $codexDepois.Installed) { throw "A instalacao terminou, mas o aplicativo nao foi detectado." }
             $codexDesktopOk = $true
-            Write-Ok "Codex Desktop instalado com sucesso."
-            Write-Ok "Pesquise por 'Codex' no Menu Iniciar para abrir o app."
+            Write-Ok "ChatGPT/Codex Desktop instalado com sucesso."
+            Write-Ok "Pesquise por 'ChatGPT' no Menu Iniciar para abrir o app."
             Pause-Readable 3
         } catch {
+            Set-OperationFailure -Name 'Codex Desktop' -Reason $_.Exception.Message
             Write-Fail "Falha ao instalar Codex Desktop: $_"
             Write-Warn "Tente manualmente: https://apps.microsoft.com/detail/9plm9xgg6vks"
             Pause-Readable 4
@@ -3695,14 +3609,15 @@ if ($instalarCodexDesk) {
         Write-Host "  https://get.microsoft.com/installer/download/9PLM9XGG6VKS?cid=website_cta_psi" -ForegroundColor Cyan
         Write-Host ""
         if (Confirm-Tecla 'Deseja realizar o download agora?') {
-            $setupPath = "$env:USERPROFILE\Downloads\CodexSetup.exe"
+            $uCodexDesk = Get-UsuarioInterativo
+            $setupPath = Join-Path $uCodexDesk.UserProfile "Downloads\ChatGPTSetup.exe"
             try {
                 Write-Step "Baixando Codex Desktop..."
                 $null = Invoke-FastDownload -Url "https://get.microsoft.com/installer/download/9PLM9XGG6VKS?cid=website_cta_psi" -OutFile $setupPath -Label "Codex Desktop"
                 $bytes = [System.IO.File]::ReadAllBytes($setupPath)
                 if ($bytes[0] -eq 77 -and $bytes[1] -eq 90) {
                     Write-Ok "Download concluido: $setupPath"
-                    Write-Warn "Execute o arquivo para instalar o Codex Desktop."
+                    Write-Warn "Execute o arquivo para instalar o ChatGPT/Codex Desktop."
                 } else {
                     Remove-Item $setupPath -Force
                     Write-Fail "O arquivo baixado nao e valido. Acesse o link manualmente."
@@ -3733,11 +3648,14 @@ if ($instalarOpenDesk) {
         if ($wingetOk) {
             Write-Step "Verificando atualizacoes..."
             try {
-                & winget upgrade --id SST.OpenCodeDesktop --silent --accept-package-agreements --accept-source-agreements 2>&1 |
+                & winget upgrade --id SST.OpenCodeDesktop --exact --silent --scope user --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 |
                     Where-Object { $_ -notmatch '^\s*[-\\|/]\s*$' } |
                     ForEach-Object { if ($_.Trim()) { Write-Host $_ } }
+                if ($LASTEXITCODE -ne 0) { throw "WinGet encerrou com o codigo $LASTEXITCODE." }
+                if (Test-WingetUpgradeAvailable -Id 'SST.OpenCodeDesktop') { throw "A atualizacao continua pendente depois da execucao do WinGet." }
                 Write-Ok "Verificacao do OpenCode Desktop concluida."
             } catch {
+                Set-OperationFailure -Name 'OpenCode Desktop' -Reason $_.Exception.Message
                 Write-Warn "Nao foi possivel verificar atualizacoes: $_"
             }
         }
@@ -3745,13 +3663,17 @@ if ($instalarOpenDesk) {
     } elseif ($wingetOk) {
         Write-Step "OpenCode Desktop nao encontrado. Instalando via winget..."
         try {
-            & winget install --id SST.OpenCodeDesktop --silent --accept-package-agreements --accept-source-agreements 2>&1 |
+            & winget install --id SST.OpenCodeDesktop --exact --silent --scope user --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 |
                 Where-Object { $_ -notmatch '^\s*[-\\|/]\s*$' } |
                 ForEach-Object { if ($_.Trim()) { Write-Host $_ } }
+            if ($LASTEXITCODE -ne 0) { throw "WinGet encerrou com o codigo $LASTEXITCODE." }
+            $openDepois = Get-OpenCodeDesktopInfo -WingetOk $true
+            if (-not $openDepois.Installed) { throw "A instalacao terminou, mas o OpenCode Desktop nao foi detectado." }
             Write-Ok "OpenCode Desktop instalado com sucesso."
             Write-Ok "Procure por 'OpenCode' no Menu Iniciar para abrir o app."
             Pause-Readable 3
         } catch {
+            Set-OperationFailure -Name 'OpenCode Desktop' -Reason $_.Exception.Message
             Write-Fail "Falha ao instalar OpenCode Desktop: $_"
             Write-Warn "Acesse: https://opencode.ai para instalar manualmente."
             Pause-Readable 4
@@ -3888,7 +3810,10 @@ if ($algumaCLI) {
 # ----------------------------------------------------------
 $algumInstalado = $false
 
-if ($instalarGit -and $gitCmdExe -and (Test-Path $gitCmdExe)) {
+$gitFailure = Get-OperationFailure -Name 'Git Bash'
+if ($instalarGit -and $gitFailure) {
+    Add-InstallResult -Nome "Git Bash" -Status "FALHOU" -Obs $gitFailure
+} elseif ($instalarGit -and $gitCmdExe -and (Test-Path $gitCmdExe)) {
     try {
         $v = (& $gitCmdExe --version 2>&1 | Out-String).Trim()
         Add-InstallResult -Nome "Git Bash" -Status "OK" -Versao $v -Local $gitBashPath
@@ -3902,7 +3827,10 @@ if ($instalarGit -and $gitCmdExe -and (Test-Path $gitCmdExe)) {
 
 if ($instalarClaudeCLI) {
     $claudeInfoFinal = Get-CliToolInfo -Cmd "claude" -NpmPackage "@anthropic-ai/claude-code"
-    if ($claudeInfoFinal.Installed) {
+    $claudeFailure = Get-OperationFailure -Name 'Claude Code'
+    if ($claudeFailure) {
+        Add-InstallResult -Nome "Claude Code" -Status "FALHOU" -Obs $claudeFailure
+    } elseif ($claudeInfoFinal.Installed) {
         Add-InstallResult -Nome "Claude Code" -Status "OK" -Versao $claudeInfoFinal.Version -Local $claudeInfoFinal.Source
         $algumInstalado = $true
     } else {
@@ -3911,7 +3839,10 @@ if ($instalarClaudeCLI) {
 }
 if ($instalarCodexCLI) {
     $codexCliInfoFinal = Get-CliToolInfo -Cmd "codex" -NpmPackage "@openai/codex"
-    if ($codexCliInfoFinal.Installed) {
+    $codexFailure = Get-OperationFailure -Name 'Codex CLI'
+    if ($codexFailure) {
+        Add-InstallResult -Nome "Codex CLI" -Status "FALHOU" -Obs $codexFailure
+    } elseif ($codexCliInfoFinal.Installed) {
         Add-InstallResult -Nome "Codex CLI" -Status "OK" -Versao $codexCliInfoFinal.Version -Local $codexCliInfoFinal.Source
         $algumInstalado = $true
     } else {
@@ -3920,7 +3851,10 @@ if ($instalarCodexCLI) {
 }
 if ($instalarOpenCode) {
     $openInfoFinal = Get-CliToolInfo -Cmd "opencode" -NpmPackage "opencode-ai"
-    if ($openInfoFinal.Installed) {
+    $openFailure = Get-OperationFailure -Name 'OpenCode'
+    if ($openFailure) {
+        Add-InstallResult -Nome "OpenCode" -Status "FALHOU" -Obs $openFailure
+    } elseif ($openInfoFinal.Installed) {
         Add-InstallResult -Nome "OpenCode" -Status "OK" -Versao $openInfoFinal.Version -Local $openInfoFinal.Source
         $algumInstalado = $true
     } else {
@@ -3929,7 +3863,10 @@ if ($instalarOpenCode) {
 }
 if ($instalarClaudeDesk) {
     $claudeDeskInfoFinal = Get-ClaudeDesktopInfo -WingetOk $wingetOk
-    if ($claudeDeskInfoFinal.Installed) {
+    $claudeDeskFailure = Get-OperationFailure -Name 'Claude Desktop'
+    if ($claudeDeskFailure) {
+        Add-InstallResult -Nome "Claude Desktop" -Status "FALHOU" -Obs $claudeDeskFailure
+    } elseif ($claudeDeskInfoFinal.Installed) {
         Add-InstallResult -Nome "Claude Desktop" -Status "OK" -Versao $claudeDeskInfoFinal.Version -Local $claudeDeskInfoFinal.Source
         $algumInstalado = $true
     } elseif ($wingetOk) {
@@ -3941,7 +3878,10 @@ if ($instalarClaudeDesk) {
 
 if ($instalarCodexDesk) {
     $codexDeskInfoFinal = Get-CodexDesktopInfo -WingetOk $wingetOk
-    if ($codexDesktopOk -or $codexDeskInfoFinal.Installed) {
+    $codexDeskFailure = Get-OperationFailure -Name 'Codex Desktop'
+    if ($codexDeskFailure) {
+        Add-InstallResult -Nome "Codex Desktop" -Status "FALHOU" -Obs $codexDeskFailure
+    } elseif ($codexDesktopOk -or $codexDeskInfoFinal.Installed) {
         Add-InstallResult -Nome "Codex Desktop" -Status "OK" -Versao $codexDeskInfoFinal.Version -Local $codexDeskInfoFinal.Source
         $algumInstalado = $true
     } elseif ($wingetOk) {
@@ -3952,7 +3892,10 @@ if ($instalarCodexDesk) {
 }
 if ($instalarOpenDesk) {
     $openDeskInfoFinal = Get-OpenCodeDesktopInfo -WingetOk $wingetOk
-    if ($openDeskInfoFinal.Installed) {
+    $openDeskFailure = Get-OperationFailure -Name 'OpenCode Desktop'
+    if ($openDeskFailure) {
+        Add-InstallResult -Nome "OpenCode Desktop" -Status "FALHOU" -Obs $openDeskFailure
+    } elseif ($openDeskInfoFinal.Installed) {
         Add-InstallResult -Nome "OpenCode Desktop" -Status "OK" -Versao $openDeskInfoFinal.Version -Local $openDeskInfoFinal.Source
         $algumInstalado = $true
     } elseif ($wingetOk) {
