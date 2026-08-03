@@ -49,7 +49,7 @@
     Instala somente Claude Code e Codex CLI sem prompts.
 
 .NOTES
-    Versao: 2.11.2
+    Versao: 2.11.3
     Compatibilidade: Windows 10 1809+/11, Server 2019+, PowerShell 5.1+
 #>
 [CmdletBinding(DefaultParameterSetName='Interactive', SupportsShouldProcess=$true)]
@@ -104,9 +104,10 @@ if ($LogPath -or ($Silent -and -not $LogPath)) {
 # ----------------------------------------------------------
 # Versao e Historico de Atualizacoes
 # ----------------------------------------------------------
-$SCRIPT_VERSION = "2.11.2"
+$SCRIPT_VERSION = "2.11.3"
 $SCRIPT_DATA    = "03/08/2026"
 $CHANGELOG = @(
+    [PSCustomObject]@{ Versao = "2.11.3"; Data = "03/08/2026"; Descricao = "Seguranca: remove -EncodedCommand dos testes de inicializacao para evitar alertas comportamentais do antivirus" }
     [PSCustomObject]@{ Versao = "2.11.2"; Data = "03/08/2026"; Descricao = "Auditoria: confirma os metodos oficiais atuais de Claude, Codex, OpenCode, Node.js e Git" }
     [PSCustomObject]@{ Versao = "2.11.2"; Data = "03/08/2026"; Descricao = "OpenCode Desktop: adiciona fallback pelo instalador oficial do GitHub quando o WinGet falhar" }
     [PSCustomObject]@{ Versao = "2.11.2"; Data = "03/08/2026"; Descricao = "Diagnostico: alerta sobre registros duplicados dos aplicativos Desktop no WinGet" }
@@ -656,10 +657,26 @@ function Invoke-PowerShellCommandProbe {
         $shellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     }
 
-    $safeName = $CommandName.Replace("'", "''")
-    $probeScript = "& { & '$safeName' --version }"
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probeScript))
-    return Invoke-ProcessProbe -FilePath $shellExe -Arguments "-NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded" -TimeoutSec $TimeoutSec
+    try {
+        $resolved = Get-Command $CommandName -CommandType Application,ExternalScript -ErrorAction Stop | Select-Object -First 1
+        if (-not $resolved -or -not $resolved.Source) { throw "Comando nao resolvido: $CommandName" }
+
+        $source = $resolved.Source
+        if ([System.IO.Path]::GetExtension($source) -ieq '.ps1') {
+            $quotedSource = '"' + ($source -replace '"','\"') + '"'
+            return Invoke-ProcessProbe -FilePath $shellExe -Arguments "-NoLogo -NoProfile -NonInteractive -File $quotedSource --version" -TimeoutSec $TimeoutSec
+        }
+
+        return Invoke-ProcessProbe -FilePath $source -Arguments '--version' -TimeoutSec $TimeoutSec
+    } catch {
+        return [PSCustomObject]@{
+            Success  = $false
+            ExitCode = -1
+            TimedOut = $false
+            Output   = ''
+            Error    = $_.Exception.Message
+        }
+    }
 }
 
 function Invoke-NpmConfigValueSafe {
