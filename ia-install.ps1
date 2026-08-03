@@ -48,7 +48,7 @@
     Instala somente Claude Code e Codex CLI sem prompts.
 
 .NOTES
-    Versao: 2.10.8
+    Versao: 2.10.9
     Compatibilidade: Windows 10/11, Server 2016+, PowerShell 5.1+
 #>
 [CmdletBinding(DefaultParameterSetName='Interactive', SupportsShouldProcess=$true)]
@@ -103,9 +103,11 @@ if ($LogPath -or ($Silent -and -not $LogPath)) {
 # ----------------------------------------------------------
 # Versao e Historico de Atualizacoes
 # ----------------------------------------------------------
-$SCRIPT_VERSION = "2.10.8"
-$SCRIPT_DATA    = "06/05/2026"
+$SCRIPT_VERSION = "2.10.9"
+$SCRIPT_DATA    = "03/08/2026"
 $CHANGELOG = @(
+    [PSCustomObject]@{ Versao = "2.10.9"; Data = "03/08/2026"; Descricao = "Claude Desktop: substitui ClaudeSetup.exe legado pelo MSIX oficial mais recente" }
+    [PSCustomObject]@{ Versao = "2.10.9"; Data = "03/08/2026"; Descricao = "Claude Desktop: valida o codigo de saida do WinGet e usa fallback oficial por arquitetura" }
     [PSCustomObject]@{ Versao = "2.10.8"; Data = "06/05/2026"; Descricao = "Entrada: limpa buffer antes de confirmacoes" }
     [PSCustomObject]@{ Versao = "2.10.7"; Data = "06/05/2026"; Descricao = "Diagnostico: evita travamento no npm prefix e lista vazia" }
     [PSCustomObject]@{ Versao = "2.10.6"; Data = "06/05/2026"; Descricao = "VC++: baixa a versao mais recente e atualiza se a instalada estiver antiga" }
@@ -3353,8 +3355,91 @@ if ($instalarGit) {
 # ============================================================
 # 2. CLAUDE DESKTOP
 #    Com winget    -> instalacao silenciosa
-#    Sem winget    -> orienta download manual
+#    Sem winget    -> MSIX oficial mais recente (x64/ARM64)
 # ============================================================
+function Install-ClaudeDesktopMsix {
+    [CmdletBinding()]
+    param()
+
+    $u = Get-UsuarioInterativo
+    $windowsArch = if ($env:PROCESSOR_ARCHITEW6432) {
+        $env:PROCESSOR_ARCHITEW6432
+    } else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+
+    $packageArch = switch ($windowsArch.ToUpperInvariant()) {
+        'AMD64' { 'x64' }
+        'ARM64' { 'arm64' }
+        default { $null }
+    }
+
+    if (-not $packageArch) {
+        Write-Fail "Arquitetura do Windows nao suportada pelo Claude Desktop: $windowsArch"
+        Write-Warn "Use a pagina oficial: https://claude.com/download"
+        return $false
+    }
+
+    $msixUrl = "https://claude.ai/api/desktop/win32/$packageArch/msix/latest/redirect"
+    $keepPackage = [bool]$u.ElevadoComOutroUsr
+    $packagePath = if ($keepPackage) {
+        Join-Path $u.UserProfile "Downloads\Claude-latest-$packageArch.msix"
+    } else {
+        Join-Path $env:TEMP "Claude-latest-$packageArch.msix"
+    }
+
+    try {
+        Write-Step "Baixando o MSIX oficial mais recente do Claude Desktop ($packageArch)..."
+        $downloadOk = Invoke-FastDownload -Url $msixUrl -OutFile $packagePath -Label "Claude Desktop (MSIX $packageArch)"
+        if (-not $downloadOk -or -not (Test-Path -LiteralPath $packagePath)) {
+            throw "O download do pacote MSIX nao foi concluido."
+        }
+
+        # MSIX e um container ZIP e deve iniciar com a assinatura PK.
+        $stream = [System.IO.File]::OpenRead($packagePath)
+        try {
+            $byte1 = $stream.ReadByte()
+            $byte2 = $stream.ReadByte()
+        } finally {
+            $stream.Dispose()
+        }
+        if ($byte1 -ne 0x50 -or $byte2 -ne 0x4B) {
+            throw "O arquivo baixado nao possui uma assinatura MSIX valida."
+        }
+
+        if ($u.ElevadoComOutroUsr) {
+            Write-Warn "UAC executado com outra conta; o MSIX nao sera registrado no perfil do administrador."
+            Write-Ok "Pacote atual salvo para o usuario '$($u.Username)': $packagePath"
+            Write-Warn "Abra esse arquivo na sessao do usuario para concluir a instalacao."
+            return $false
+        }
+
+        if (-not (Get-Command Add-AppxPackage -ErrorAction SilentlyContinue)) {
+            throw "Add-AppxPackage nao esta disponivel neste Windows."
+        }
+
+        Write-Step "Instalando o pacote MSIX oficial..."
+        Add-AppxPackage -Path $packagePath -ForceApplicationShutdown -ErrorAction Stop | Out-Null
+
+        $installedInfo = Get-ClaudeDesktopInfo -WingetOk $false
+        if (-not $installedInfo.Installed) {
+            throw "A instalacao terminou, mas o Claude Desktop nao foi detectado."
+        }
+
+        Write-Ok "Claude Desktop instalado com sucesso pelo MSIX oficial."
+        Write-Ok "Pesquise por 'Claude' no Menu Iniciar para abrir o app."
+        return $true
+    } catch {
+        Write-Fail "Falha ao instalar o Claude Desktop pelo MSIX oficial: $_"
+        Write-Warn "Baixe manualmente em: https://claude.com/download"
+        return $false
+    } finally {
+        if (-not $keepPackage -and (Test-Path -LiteralPath $packagePath -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $packagePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 if ($instalarClaudeDesk) {
     Write-Phase "Claude Desktop"
 
@@ -3373,7 +3458,11 @@ if ($instalarClaudeDesk) {
                 & winget upgrade --id Anthropic.Claude --silent --accept-package-agreements --accept-source-agreements 2>&1 |
                     Where-Object { $_ -notmatch '^\s*[-\\|/]\s*$' } |
                     ForEach-Object { if ($_.Trim()) { Write-Host $_ } }
-                Write-Ok "Verificacao do Claude Desktop concluida."
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Ok "Verificacao do Claude Desktop concluida."
+                } else {
+                    Write-Warn "O WinGet terminou a verificacao com o codigo $LASTEXITCODE."
+                }
             } catch {
                 Write-Warn "Nao foi possivel verificar atualizacoes: $_"
             }
@@ -3382,38 +3471,34 @@ if ($instalarClaudeDesk) {
     } elseif ($wingetOk) {
         Write-Step "Instalando Claude Desktop via winget (silencioso)..."
         try {
-            & winget install --id Anthropic.Claude --silent --accept-package-agreements --accept-source-agreements 2>&1 |
+            & winget install --id Anthropic.Claude --exact --silent --accept-package-agreements --accept-source-agreements 2>&1 |
                 Where-Object { $_ -notmatch '^\s*[-\\|/]\s*$' } |
                 ForEach-Object { if ($_.Trim()) { Write-Host $_ } }
-            Write-Ok "Claude Desktop instalado com sucesso."
+            if ($LASTEXITCODE -ne 0) {
+                throw "WinGet encerrou com o codigo $LASTEXITCODE."
+            }
+
+            $claudeDesktopInfo = Get-ClaudeDesktopInfo -WingetOk $true
+            if (-not $claudeDesktopInfo.Installed) {
+                throw "O WinGet terminou sem erro, mas o Claude Desktop nao foi detectado."
+            }
+
+            Write-Ok "Claude Desktop instalado com sucesso via WinGet."
             Write-Ok "Pesquise por 'Claude' no Menu Iniciar para abrir o app."
         } catch {
-            Write-Fail "Falha ao instalar via winget: $_"
-            Write-Warn "Baixe manualmente em: https://claude.ai/download"
+            Write-Warn "Falha ao instalar via WinGet: $_"
+            Write-Step "Tentando o pacote MSIX oficial mais recente..."
+            $null = Install-ClaudeDesktopMsix
         }
         Pause-Readable 3
     } else {
         Write-Warn "winget nao disponivel neste sistema."
         Write-Host ""
-        Write-Host "  Baixe e instale o Claude Desktop manualmente:" -ForegroundColor White
-        Write-Host "  https://claude.ai/download" -ForegroundColor Cyan
+        Write-Host "  O script pode baixar e instalar o MSIX oficial mais recente:" -ForegroundColor White
+        Write-Host "  https://claude.com/download" -ForegroundColor Cyan
         Write-Host ""
-        if (Confirm-Tecla 'Deseja realizar o download agora?') {
-            $setupPath = "$env:USERPROFILE\Downloads\ClaudeSetup.exe"
-            try {
-                Write-Step "Baixando Claude Desktop..."
-                $null = Invoke-FastDownload -Url "https://downloads.claude.ai/releases/win32/ClaudeSetup.exe" -OutFile $setupPath -Label "Claude Desktop"
-                $bytes = [System.IO.File]::ReadAllBytes($setupPath)
-                if ($bytes[0] -eq 77 -and $bytes[1] -eq 90) {
-                    Write-Ok "Download concluido: $setupPath"
-                    Write-Warn "Execute o arquivo para instalar o Claude Desktop."
-                } else {
-                    Remove-Item $setupPath -Force
-                    Write-Fail "O arquivo baixado nao e valido. Acesse o link manualmente."
-                }
-            } catch {
-                Write-Fail "Falha no download: $_"
-            }
+        if (Confirm-Tecla 'Deseja baixar e instalar o pacote atual agora?') {
+            $null = Install-ClaudeDesktopMsix
         }
         Pause-Readable 3
     }
