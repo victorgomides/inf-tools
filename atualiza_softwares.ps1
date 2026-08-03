@@ -9,11 +9,12 @@ param(
     [switch]$SkipVSCode,
     [switch]$SkipVisualStudio,
     [switch]$DetectOnly,
-    [switch]$InternalEngine
+    [switch]$InternalEngine,
+    [switch]$UnifiedController
 )
 
 $ErrorActionPreference = "Stop"
-$SCRIPT_VERSION       = '3.0.10'
+$SCRIPT_VERSION       = '3.1.0'
 $script:ExitCode       = 0
 $script:NonInteractive = $false
 $script:ThisScriptPath = $PSCommandPath
@@ -119,6 +120,7 @@ function Request-Elevation {
     if ($SkipVisualStudio) { $argList += '-SkipVisualStudio' }
     if ($DetectOnly) { $argList += '-DetectOnly' }
     if ($InternalEngine) { $argList += '-InternalEngine' }
+    if ($UnifiedController) { $argList += '-UnifiedController' }
 
     $shellPath = (Get-Command powershell.exe -ErrorAction Stop).Source
     $argumentString = Join-ArgumentList -Arguments $argList
@@ -547,6 +549,145 @@ function Invoke-UnifiedController {
         if ($mutex) { try { $mutex.Dispose() } catch { } }
         if ($cleanupError) { throw $cleanupError }
     }
+}
+
+function Get-SoftwareCatalog {
+    return @(
+        [pscustomobject]@{ Key='PowerShell7'; Name='PowerShell 7'; Ids=@('Microsoft.PowerShell','Microsoft.PowerShell.MSIX'); Command='pwsh.exe'; Ia=$null }
+        [pscustomobject]@{ Key='Chrome'; Name='Google Chrome'; Ids=@('Google.Chrome','Google.Chrome.EXE','Google.Chrome.Beta.EXE','Google.Chrome.Beta','Google.Chrome.Dev.EXE'); Command='chrome.exe'; Ia=$null }
+        [pscustomobject]@{ Key='Git'; Name='Git for Windows'; Ids=@('Git.Git'); Command='git.exe'; Ia=$null }
+        [pscustomobject]@{ Key='NodeJS'; Name='Node.js LTS'; Ids=@('OpenJS.NodeJS.LTS'); Command='node.exe'; Ia=$null }
+        [pscustomobject]@{ Key='VSCode'; Name='Visual Studio Code'; Ids=@('Microsoft.VisualStudioCode'); Command='code.cmd'; Ia=$null }
+        [pscustomobject]@{ Key='VisualStudio'; Name='Visual Studio Community'; Ids=@('Microsoft.VisualStudio.2022.Community'); Command=''; Ia=$null }
+        [pscustomobject]@{ Key='PowerBI'; Name='Power BI Desktop'; Ids=@('Microsoft.PowerBI'); Command=''; Ia=$null }
+        [pscustomobject]@{ Key='Claude'; Name='Claude'; Ids=@(); Command='claude.cmd'; Ia='ClaudeCLI,ClaudeDesk' }
+        [pscustomobject]@{ Key='Codex'; Name='Codex'; Ids=@(); Command='codex.cmd'; Ia='CodexCLI,CodexDesk' }
+        [pscustomobject]@{ Key='OpenCode'; Name='OpenCode'; Ids=@(); Command='opencode.cmd'; Ia='OpenCode,OpenDesk' }
+    )
+}
+
+function Get-InstalledWingetId {
+    param([string[]]$Ids)
+    if ($script:WingetListText) {
+        foreach ($id in $Ids) {
+            if ($script:WingetListText -match [regex]::Escape($id)) { return $id }
+        }
+        return $null
+    }
+    foreach ($id in $Ids) {
+        try {
+            $text = & winget.exe list --id $id --exact --accept-source-agreements --disable-interactivity 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0 -and $text -match [regex]::Escape($id) -and $text -notmatch '(?i)nenhum pacote|no installed package|no package found') { return $id }
+        } catch { }
+    }
+    return $null
+}
+
+function Test-SoftwareInstalled {
+    param($Item)
+    if ($Item.Key -eq 'VisualStudio') { return (@(Get-UnifiedInstalledEditions).Count -gt 0) }
+    if ($Item.Key -eq 'PowerBI') { return (Test-UnifiedPowerBIInstalled) }
+    if ($Item.Key -eq 'Chrome') {
+        foreach ($path in @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe")) {
+            if ($path -and (Test-Path -LiteralPath $path -PathType Leaf)) { return $true }
+        }
+    }
+    if ($Item.Command -and (Get-Command $Item.Command -ErrorAction SilentlyContinue)) { return $true }
+    return [bool](Get-InstalledWingetId -Ids $Item.Ids)
+}
+
+function Get-SoftwareState {
+    param($Item)
+    $installed = Test-SoftwareInstalled $Item
+    $id = if ($Item.Ids.Count) { Get-InstalledWingetId -Ids $Item.Ids } else { $null }
+    $update = $false
+    if ($installed -and $id) {
+        $update = ($script:WingetUpgradeText -and $script:WingetUpgradeText -match [regex]::Escape($id))
+    }
+    elseif ($installed -and $Item.Ia -and $Item.Command) {
+        try {
+            $package = switch ($Item.Key) { 'Claude' {'@anthropic-ai/claude-code'}; 'Codex' {'@openai/codex'}; 'OpenCode' {'opencode-ai'} }
+            $currentText = & $Item.Command --version 2>$null | Select-Object -First 1
+            $current = [regex]::Match([string]$currentText,'\d+(\.\d+){1,3}').Value
+            $latest = (Invoke-RestMethod -Uri ("https://registry.npmjs.org/{0}/latest" -f $package) -TimeoutSec 20).version
+            if ($current -and $latest) { $update = ([version]$latest -gt [version]$current) }
+        } catch { $update = $false }
+    }
+    [pscustomobject]@{ Item=$Item; Installed=$installed; UpdateAvailable=$update; InstalledId=$id }
+}
+
+function Get-TemporaryIaEngine {
+    $target = Join-Path $env:TEMP 'InfinityHubScripts\ia-install.ps1'
+    $parent = Split-Path -Parent $target
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $uri = 'https://raw.githubusercontent.com/victorgomides/inf-tools/main/ia-install.ps1'
+    Invoke-WebRequest -Uri $uri -OutFile $target -UseBasicParsing -TimeoutSec 60
+    $tokens=$null; $errors=$null
+    [Management.Automation.Language.Parser]::ParseFile($target,[ref]$tokens,[ref]$errors) | Out-Null
+    if ($errors.Count -or -not (Select-String -LiteralPath $target -Pattern 'ClaudeCLI' -Quiet)) { throw 'O motor de IA baixado nao passou na validacao.' }
+    return $target
+}
+
+function Invoke-SoftwareAction {
+    param($State)
+    $item = $State.Item
+    if ($item.Ia) {
+        $engine = Get-TemporaryIaEngine
+        $shell = if (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { 'pwsh.exe' } else { 'powershell.exe' }
+        & $shell -NoLogo -NoProfile -File $engine -Pacotes ($item.Ia -split ',') -Silent
+        return ($LASTEXITCODE -eq 0)
+    }
+    $id = if ($State.InstalledId) { $State.InstalledId } else { $item.Ids[0] }
+    $operation = if ($State.Installed) { 'upgrade' } else { 'install' }
+    $args = @($operation,'--id',$id,'--exact','--silent','--accept-package-agreements','--accept-source-agreements','--disable-interactivity')
+    if ($operation -eq 'upgrade') { $args += '--include-unknown' }
+    & winget.exe @args
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Invoke-SoftwareManager {
+    Initialize-ConsoleUi -Title 'Infinity - Gerenciador de Softwares'
+    Write-Host ''
+    Write-Host '  Infinity - Gerenciador de Softwares' -ForegroundColor White
+    Write-Host ("  Diagnostico e acoes | v{0}" -f $SCRIPT_VERSION) -ForegroundColor DarkCyan
+    Write-Host ''
+    if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) { throw 'WinGet nao esta disponivel neste computador.' }
+    Write-UnifiedStatus 'Diagnostico' 'Consultando aplicativos instalados e atualizacoes...'
+    $script:WingetListText = (& winget.exe list --accept-source-agreements --disable-interactivity 2>&1 | Out-String)
+    $script:WingetUpgradeText = (& winget.exe upgrade --accept-source-agreements --disable-interactivity 2>&1 | Out-String)
+    $states = @(Get-SoftwareCatalog | ForEach-Object { Get-SoftwareState $_ })
+    $actions = New-Object System.Collections.Generic.List[object]
+    foreach ($state in $states) {
+        if (-not $state.Installed) { $label='Nao instalado'; $color='Yellow'; [void]$actions.Add($state) }
+        elseif ($state.UpdateAvailable) { $label='Atualizacao disponivel'; $color='Cyan'; [void]$actions.Add($state) }
+        else { $label='Atualizado'; $color='Green' }
+        Write-Host ("  {0,-28} {1}" -f $state.Item.Name,$label) -ForegroundColor $color
+    }
+    Write-Host ''
+    if (-not $actions.Count) { Write-UnifiedStatus 'Conclusao' 'Todos os aplicativos estao instalados e atualizados.' Ok; return }
+    Write-Host '  ACOES DISPONIVEIS' -ForegroundColor White
+    for ($i=0; $i -lt $actions.Count; $i++) {
+        $verb = if ($actions[$i].Installed) { 'Atualizar' } else { 'Instalar' }
+        Write-Host ("  [{0}] {1} {2}" -f ($i+1),$verb,$actions[$i].Item.Name)
+    }
+    Write-Host '  [A] Executar todas as acoes' -ForegroundColor Yellow
+    Write-Host '  [0] Voltar'
+    $answer = Read-Host '  Escolha numeros separados por virgula'
+    if ($answer -eq '0' -or [string]::IsNullOrWhiteSpace($answer)) { return }
+    $selected = if ($answer -match '^(?i)a$') { @($actions) } else {
+        @($answer -split '[,; ]+' | ForEach-Object { $n=0; if ([int]::TryParse($_,[ref]$n) -and $n -ge 1 -and $n -le $actions.Count) { $actions[$n-1] } })
+    }
+    foreach ($state in $selected) {
+        $verb = if ($state.Installed) { 'Atualizando' } else { 'Instalando' }
+        Write-UnifiedStatus $state.Item.Name $verb
+        if (Invoke-SoftwareAction $state) { Write-UnifiedStatus $state.Item.Name 'Concluido.' Ok }
+        else { Write-UnifiedStatus $state.Item.Name 'Falha no processamento.' Error; $script:ExitCode=1 }
+    }
+}
+
+if (-not $InternalEngine -and -not $UnifiedController -and -not $DetectOnly) {
+    try { Invoke-SoftwareManager } catch { Write-UnifiedStatus 'Execucao' $_.Exception.Message Error; $script:ExitCode=1 }
+    exit $script:ExitCode
 }
 
 if (-not $DetectOnly -and -not (Test-IsElevated)) {
